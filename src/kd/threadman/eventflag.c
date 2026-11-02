@@ -275,10 +275,16 @@ THREADMAN_WITH_CALLBACKS_THUNK(sceKernelWaitEventFlagCB, _sceKernelWaitEventFlag
 /*
  * PARITY-Q048: Value read once into a local (the original keeps it in one register).
  * PARITY-Q060 (a024847): A 'matched' value tested / returned directly, as the original.
+ * PARITY-Q193 (trick): wait and outBits are copied into local register variables ($s3, $s1), which gives the
+ *     original's callee-saved assignment for bits/wait/outBits (global alloc otherwise swaps bits/wait and puts
+ *     outBits in $s0). sched, csim +0.123, wsim 0, same size. Residue: timeout/oldK1/eventFlag still rotated
+ *     ($s5/$s4/$s6 vs $s6/$s5/$s4); pinning them adds 1-6 moves. Not applied to sceKernelPollEventFlag (wsim -0.007).
  */
 // Subroutine sub_00005740 - Address 0x00005740
-static s32 __attribute__((used)) _sceKernelWaitEventFlag(SceUID evid, u32 bits, u32 wait, u32 *outBits, SceUInt *timeout)
+static s32 __attribute__((used)) _sceKernelWaitEventFlag(SceUID evid, u32 bits, u32 wait_, u32 *outBits_, SceUInt *timeout)
 {
+    register u32 wait asm("$19") = wait_; /* PARITY-Q193: wait in $s3 (bits then gets $s2) */
+    register u32 *outBits asm("$17") = outBits_; /* PARITY-Q193: outBits in $s1 */
     s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
@@ -396,9 +402,16 @@ static s32 __attribute__((used)) _sceKernelWaitEventFlag(SceUID evid, u32 bits, 
     return status;
 }
 
+/*
+ * PARITY-Q194 (trick): wait and outBits are copied into local register variables ($s0, $s1), the original's
+ *     callee-saved registers for them (bits then gets $s2 as in the original). sched, csim +0.151, wsim 0, same size.
+ *     Residue: evid/oldK1/intr/%hi(g_threadman) rotated. Also pinning bits: csim +0.186 but wsim -0.007 (rejected).
+ */
 // Subroutine sceKernelPollEventFlag - Address 0x00005B70
-int sceKernelPollEventFlag(int evid, u32 bits, u32 wait, u32 *outBits)
+int sceKernelPollEventFlag(int evid, u32 bits, u32 wait_, u32 *outBits_)
 {
+    register u32 wait asm("$16") = wait_; /* PARITY-Q194: wait in $s0 (bits then gets $s2) */
+    register u32 *outBits asm("$17") = outBits_; /* PARITY-Q194: outBits in $s1 */
     s32 oldK1;
     s32 intr;
     s32 matched;

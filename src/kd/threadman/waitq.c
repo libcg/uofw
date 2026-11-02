@@ -416,7 +416,7 @@ void sub_00000FE4(s32 release, s32 intr)
         thread->waitWithCallbacks = 0;
         threadmanProfilerResume();
     } else {
-        pspCop0StateSet(COP0_STATE_CAUSE, pspCop0StateGet(COP0_STATE_CAUSE) | 0x200);
+        threadmanCop0StateOr(COP0_STATE_CAUSE, 0x200); /* PARITY-Q184 */
         sceKernelEnableIntr(SCE_THREAD1_INT);
     }
 }

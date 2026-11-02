@@ -111,7 +111,7 @@ s32 _sceKernelSysTimerResume(s32 unk, void *param)
 } while (0)
 #else
 #define THREADMAN_DIVU(quot, rem, a, b) \
-    __asm__ __volatile__ ("divu %2, %3" : "=l" (quot), "=h" (rem) : "r" (a), "r" (b))
+    __asm__ __volatile__ ("divu %2, %3" : "=h" (rem), "=l" (quot) : "r" (a), "r" (b)) /* PARITY-Q191: "=h" first */
 #endif
 
 /*
@@ -121,6 +121,11 @@ s32 _sceKernelSysTimerResume(s32 unk, void *param)
  *     reused for quotHi; the remainder stays in HI across the loop (the original keeps it in $v1 with an mfhi in
  *     the loop); and beqz/nop is used where the original has bnel for the rem store.
  *     Rejected: the three orders of the low/quotHi/first-divide statements (0 or down).
+ * PARITY-Q191 (trick): the remainder and quotHi are local register variables ($v1, $t2) and the divu asm lists the
+ *     "=h" output before "=l" (mfhi is emitted before mflo, as in the original). This forces the remainder out of
+ *     HI into $v1 with the mfhi at the loop end. wsim +0.056, csim +0.277, still equiv. Residue: quot is copied to
+ *     $t3 and quotHi goes through $v0 plus a move. Rejected: widening the asm to divu/mflo/mfhi (csim -0.081), a
+ *     tied dividend operand (no change), and 64 pin combinations of r/quotLow/low/quotHi/i (best kept).
  */
 /**
  * Divide a system clock value by a 32-bit value.
@@ -136,9 +141,9 @@ void _sceKernelSysClockDivide(SceKernelSysClock *quot, SceKernelSysClock *clock,
     s32 i;
     u32 low;
     u32 cur;
-    u32 r;
+    register u32 r asm("$3"); /* PARITY-Q191: remainder kept in $v1 (mfhi at the loop end) */
     u32 quotLow;
-    u32 quotHi;
+    register u32 quotHi asm("$10"); /* PARITY-Q191: quotHi in $t2 */
     u32 q;
 
     low = clock->low;

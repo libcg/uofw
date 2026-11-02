@@ -81,6 +81,47 @@ static inline s32 threadmanCop0CtrlGet(int reg)
     return ret;
 }
 
+/*
+ * COP0 state register read in program order (a volatile asm).
+ * Reproduces (6.60 sceKernelChangeCurrentThreadAttr, 0x143C4-0x143CC):
+ *     sw    $t2, 0x14($s1)        thread->attr = ...
+ *     mfc0  $v1, Status           read right after the attr store,
+ *     andi  $t1, $t2, 0x4000      before the SCE_KERNEL_TH_USE_VFPU test.
+ * Why not C: C has no way to read a COP0 register, so an asm is unavoidable; and common/cop0.h's pspCop0StateGet()
+ * is a non-volatile asm, which GCC is free to sink below the attr test to the first use of the value. Only a
+ * volatile asm stays where the source puts it.
+ */
+/*
+ * PARITY-Q185 (user-approved inline asm, 19:03 PT 2026-10-27): volatile mfc0 for the Status read in
+ * sceKernelChangeCurrentThreadAttr; uses grep threadmanCop0StateGet
+ */
+static inline s32 threadmanCop0StateGet(int reg)
+{
+    s32 ret;
+    asm volatile ("mfc0 %0, $%1" : "=r" (ret) : "ri" (reg));
+    return ret;
+}
+
+/*
+ * Set bits in a COP0 state register (mfc0/ori/mtc0 in one asm, one register for the whole read-modify-write).
+ * Reproduces (6.60 sub_00000FE4, 0x010D0-0x010D8, Cause |= 0x200 before sceKernelEnableIntr):
+ *     mfc0  $v0, Cause
+ *     ori   $v0, $v0, 0x200
+ *     mtc0  $v0, Cause
+ * Why not C: C has no way to access COP0, so the mfc0 and mtc0 are asm in any case. Written as
+ * pspCop0StateSet(reg, pspCop0StateGet(reg) | imm) the ori is a C operation between two asms and regrename gives
+ * its result a second register ($t6 read, $t5 or-result/write); the original uses $v0 for all three instructions.
+ * Keeping the three in one asm with one early-clobber operand is the only way to tie them to one register.
+ */
+/*
+ * PARITY-Q184 (user-approved inline asm, 19:03 PT 2026-10-27): single-asm mfc0/ori/mtc0 Cause read-modify-write in
+ * sub_00000FE4; uses grep threadmanCop0StateOr
+ */
+#define threadmanCop0StateOr(reg, imm) do { \
+    s32 _v; \
+    asm volatile ("mfc0 %0, $%1\n\tori %0, %0, %2\n\tmtc0 %0, $%1" : "=&r" (_v) : "i" (reg), "i" (imm)); \
+} while (0)
+
 /* Read $gp in program order (a volatile asm, like common/registers.h's pspGetSp()). */
 /* PARITY-Q010: volatile $gp read: the original reads $gp in program order; uses grep threadmanGetGp */
 static inline u32 threadmanGetGp(void)
@@ -937,12 +978,17 @@ typedef struct {
  * asm gives (registers.h pspSetGp() is non-volatile, so GCC hoists the $gp read into an earlier block).
  */
 /* PARITY-Q005: volatile $gp save+switch kept together after the new value's load, as in the original handler calls */
+/*
+ * PARITY-Q190 (trick): memory clobber on the $gp switch: the compiler may not keep memory values in registers
+ *     across it, so _sceKernelFreeThreadKTLS reloads the destructor after the switch (lw $v1,0xC($s2) after
+ *     move $gp,$v0) as the original does. The alarm/vtimer handler calls are unchanged.
+ */
 static inline u32 threadmanSwapGp(u32 gp)
 {
     u32 oldGp;
 
     asm volatile("move %0, $gp" : "=r" (oldGp));
-    asm volatile("move $gp, %0" : : "r" (gp));
+    asm volatile("move $gp, %0" : : "r" (gp) : "memory"); /* PARITY-Q190: memory clobber */
     return oldGp;
 }
 
@@ -1291,6 +1337,11 @@ typedef struct {
      * PARITY-Q159: Integer field (cast to SceSysmemUidCB * at each use) instead of a pointer: its loads share the s32
      *     alias set, so the scheduler keeps them after int stores to g_threadman (sub_00010FAC: after the
      *     numFreeDelays decrement), as in the original.
+     *     USER-APPROVED TYPE-PUN EXCEPTION (19:03 PT 2026-10-27): kept although it is a pointer held in an integer.
+     *     Why: under -fstrict-aliasing a pointer-typed field gets its own alias set, and sched2 then hoists the
+     *     free-list path's timerType load above the s32 numFreeDelays store; only the s32 alias set gives the original
+     *     load order in sub_00010FAC (exact with it, sched 0.988 without it). See threadman-deviations.md
+     *     "Approved exceptions".
      */
     /** The "Timer" UID type (the base type of the delay timers, the alarms and the virtual timers). */
     s32 timerType; // 1276

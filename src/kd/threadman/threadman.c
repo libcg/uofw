@@ -459,9 +459,14 @@ save:
  *
  * @return The context to resume.
  */
+/*
+ * PARITY-Q195 (trick): arg is copied into a $s4 local register variable (the original's register for it). The
+ *     dispatcher drops from 249 to 248 instructions (original 247); wsim +0.002, csim +0.006, still equiv.
+ */
 // Subroutine sub_00012828 - Address 0x00012828
-SceThreadmanContext *sub_00012828(SceThreadmanContext *context, s32 arg)
+SceThreadmanContext *sub_00012828(SceThreadmanContext *context, s32 arg_)
 {
+    register s32 arg asm("$20") = arg_; /* PARITY-Q195: arg in $s4 */
     u32 sp;
     u32 kSp;
     u64 now;
@@ -1624,7 +1629,7 @@ s32 sceKernelChangeCurrentThreadAttr(u32 clearAttr, u32 setAttr)
     THREADMAN_LOG(SCE_THREADMAN_LOG_CHANGE_CURRENT_THREAD_ATTR, 2, clearAttr, setAttr);
     intr = sceKernelCpuSuspendIntr();
     thread->attr = (thread->attr & ~clearAttr) | setAttr;
-    status = pspCop0StateGet(COP0_STATE_STATUS);
+    status = threadmanCop0StateGet(COP0_STATE_STATUS); /* PARITY-Q185 */
     if ((thread->attr & SCE_KERNEL_TH_USE_VFPU) && !(status & SCE_THREADMAN_CONTEXT_STATUS_CU2)) {
         /* Enable the VFPU. */
         if (thread->vfpuContext == NULL) {
@@ -3162,6 +3167,11 @@ SceKernelIdListType sceKernelGetThreadmanIdType(SceUID uid)
  * PARITY-Q048 (0e15864): Value read once into a local (the original keeps it in one register).
  * PARITY-Q064 (9568ff2): Switch result kept in its own variable / lookup result and owner type in one variable (the
  *     original's register use).
+ * PARITY-Q192 (trick): owner is a local register variable ($s1; blockId then gets $s2 as in the original); the
+ *     thread-found type store builds SCE_KERNEL_TMID_Thread in a $v0 register variable held by an empty asm input,
+ *     and the final type store has an empty volatile asm. Without them, cross-jumping merges the two stores (the
+ *     thread block branches into the main tail, 5 instructions short) and regrename picks $a3/$t5. equiv -> exact.
+ *     Each of the three alone or in pairs: still equiv.
  */
 /**
  * Find the threadman object owning a memory block (a memory pool or a thread stack).
@@ -3177,7 +3187,7 @@ SceUID sceKernelGetThreadmanIdOwner(SceUID blockId, SceKernelIdListType *type)
     s32 oldK1;
     s32 intr;
     s32 ret;
-    SceUID owner;
+    register SceUID owner asm("$17"); /* PARITY-Q192: owner in $s1, blockId in $s2 */
     SceSysmemUidCB *cb;
     SceSysmemUidCB *threadType;
 
@@ -3225,8 +3235,12 @@ SceUID sceKernelGetThreadmanIdOwner(SceUID blockId, SceKernelIdListType *type)
                 }
             }
             if (owner > 0) {
-                if (type != NULL)
-                    *type = SCE_KERNEL_TMID_Thread;
+                if (type != NULL) {
+                    /* PARITY-Q192: type built in $v0; keeps this store out of the cross-jump with the one below */
+                    register s32 tmid asm("$2") = SCE_KERNEL_TMID_Thread;
+                    asm("" : : "r"(tmid));
+                    *type = tmid;
+                }
                 sceKernelCpuResumeIntr(intr);
                 pspSetK1(oldK1);
                 return owner;
@@ -3237,8 +3251,10 @@ SceUID sceKernelGetThreadmanIdOwner(SceUID blockId, SceKernelIdListType *type)
         return SCE_ERROR_KERNEL_UNKNOWN_UID;
     }
 
-    if (type != NULL)
+    if (type != NULL) {
+        asm volatile(""); /* PARITY-Q192: the store keeps its own beqz/nop block */
         *type = ret;
+    }
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return owner;
@@ -3488,6 +3504,14 @@ s32 sub_00016FA4(void)
     else {
         if (thread->stackLow == NULL)
             return 0;
+        /*
+         * PARITY-Q199 (trick): empty volatile asm barrier. It keeps the kernel-stack arm's
+         * `freeSize = &freeSize - stackLow` from being merged with the user arm at the join
+         * (cross-jumping) and changes the register choice for freeSize, which gives the
+         * original's separate subu/sw per arm and its $v0/$a2/$a3/$t0 registers (barrier/pin search,
+         * /workspace/scratch-alloc/ab; -fno-crossjumping alone: equiv 0.725).
+         */
+        __asm__ __volatile__("");
         freeSize = (u32)&freeSize - (u32)thread->stackLow;
     }
 
@@ -3655,6 +3679,10 @@ PspDebugProfilerRegs *sceKernelReferThreadProfiler(void)
  *     holding the address, not a separate return value.
  * PARITY-Q083: The NULL case is reached with a goto: the front end's goto prediction moves it after the return
  *     (the original's bne to an out-of-line NULL block that jumps back).
+ * PARITY-Q189 (trick): two local register variables anchored with empty asm statements: the profiler register
+ *     offset (0xBC400000) is built first, in $a1, and the profiler mode is compared from $a2, as in the original
+ *     (GCC 3.3 schedules the mode constant before the offset and register-renames all three temporaries).
+ *     They force the registers and the order only; no code is added.
  */
 /**
  * Get the global profiler registers (in profiler global mode).
@@ -3665,11 +3693,18 @@ PspDebugProfilerRegs *sceKernelReferThreadProfiler(void)
 PspDebugProfilerRegs *sceKernelReferGlobalProfiler(void)
 {
     SceThreadmanSegAddr regs;
+    register u32 offset asm("$5") = (u32)THREADMAN_HW_PROFILER_REGS; /* PARITY-Q189: $a1, built first */
 
+    asm("" : "+r"(offset));
     regs.s.segment = THREADMAN_PROFILER_REGS_SEGMENT;
-    if (g_threadman.profilerMode != SCE_THREADMAN_PROFILER_MODE_GLOBAL)
-        goto fail;
-    regs.s.offset = (u32)THREADMAN_HW_PROFILER_REGS;
+    {
+        register u32 mode asm("$6") = g_threadman.profilerMode; /* PARITY-Q189: compared from $a2 */
+
+        asm("" : : "r"(mode));
+        if (mode != SCE_THREADMAN_PROFILER_MODE_GLOBAL)
+            goto fail;
+    }
+    regs.s.offset = offset;
 end:
     return (PspDebugProfilerRegs *)regs.addr;
 fail:

@@ -132,6 +132,10 @@ s32 sceKernelFreeKTLS(s32 id)
  *
  * @return The block, or NULL on error (or if the thread has no block and alloc is zero).
  */
+/*
+ * PARITY-Q188: The allocation path is predicted taken (__builtin_expect). The higher block frequency of its ktls uses
+ *     gives ktls a higher global-allocation priority than thid, so ktls gets $s2 and thid $s3 as in the original.
+ */
 // Subroutine sceKernelGetThreadKTLS - Address 0x00011C68
 void *sceKernelGetThreadKTLS(s32 id, SceUID thid, s32 alloc)
 {
@@ -172,7 +176,7 @@ void *sceKernelGetThreadKTLS(s32 id, SceUID thid, s32 alloc)
     block = thread->ktls[id];
     if (block != NULL) {
         THREADMAN_LOG(SCE_THREADMAN_LOG_GET_THREAD_KTLS, 4, id, thid, alloc, block);
-    } else if (alloc != 0) {
+    } else if (__builtin_expect(alloc != 0, 1)) { /* PARITY-Q188 */
         block = sceKernelAllocHeapMemory(g_threadman.heapId, ktls->size);
         THREADMAN_LOG(SCE_THREADMAN_LOG_GET_THREAD_KTLS, 4, id, thid, alloc, block);
         if (block == NULL) {
@@ -225,7 +229,16 @@ s32 _sceKernelFreeThreadKTLS(SceThreadmanThread *thread)
                 kept = 1;
                 continue;
             }
-            oldGp = threadmanSwapGp(ktls->gp);
+            {
+                /*
+                 * PARITY-Q196 (trick): register-variable pin. ktls->gp is held in $3 at local-alloc time;
+                 * regrename then moves it to $v0 and the destructor to $v1 as in the original. Stock local-alloc
+                 * gives the gp pseudo $2 (shorter lifetime, higher priority) and the destructor $3, which
+                 * regrename swaps.
+                 */
+                register u32 gp asm("$3") = ktls->gp;
+                oldGp = threadmanSwapGp(gp);
+            }
             ktls->destructor(block, ktls->arg);
             pspSetGp(oldGp);
         }

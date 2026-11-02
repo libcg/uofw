@@ -119,7 +119,13 @@ int sceKernelCreateFpl(const char *name, int part, int attr, unsigned int size, 
     type = (attr >> 14) & 1; /* SCE_KERNEL_SMEM_High with SCE_KERNEL_FPA_HIGHMEM */
     blockSize = (size + 3) & ~3;
     if (alignment != 0) {
-        if ((alignment & (alignment - 1)) != 0) {
+        /*
+         * PARITY-Q204 (trick: branch hint): the non-power-of-two alignment error is
+         * predicted not taken; the lower frequency of its block swaps the global
+         * allocation order of two pseudos (s6/s7 as in the original). Needs the
+         * blockSize store right after size below and oldgcc 5e56552 (hilo/mult).
+         */
+        if (__builtin_expect((alignment & (alignment - 1)) != 0, 0)) {
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_ILLEGAL_ARGUMENT;

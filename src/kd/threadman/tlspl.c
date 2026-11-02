@@ -489,7 +489,17 @@ int sceKernelFreeTlspl(SceUID uid)
 
     if (waitQ->numWaitThreads > 0) {
         /* Give the block to the first waiting thread. */
-        ((SceThreadmanThread *)waitQ->waitList.next)->waitData[0] = (s32)block;
+        /*
+         * PARITY-Q200 (trick, type pun): the waitData[0] store goes through a may_alias s32 (alias set 0, not an
+         * in-struct MEM). Plain member stores are MEM_IN_STRUCT, so alias.c fixed_scalar_and_varying_struct_p lets
+         * sched1 hoist the frame load of `cb` above them; local-alloc then sinks it back to the a0 move, and sched2
+         * breaks the a0/a3 tie by LUID (a0 first). With this store, the cb load stays after it in sched1, the spilled
+         * `intr` move (a3) comes first, and `lw $a0,0($sp)` lands in the jal slot as in the original.
+         */
+        {
+        typedef s32 __attribute__((__may_alias__)) s32_alias;
+        *(s32_alias *)&((SceThreadmanThread *)waitQ->waitList.next)->waitData[0] = (s32)block;
+        }
         sub_00000B08(cb, SCE_ERROR_OK, 0, intr);
     } else {
         sceKernelMemset32(block, 0, tlspl->blockSize);

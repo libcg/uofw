@@ -364,7 +364,9 @@ int sceKernelPollMbx(SceUID mbxid, void **pmessage)
     s32 intr;
     SceSysmemUidCB *uid;
     SceThreadmanMbx *mbx;
-    SceKernelMsgPacket *last;
+    /* PARITY-Q187 (trick): local register variable: `last` lives in $a1 as in the original (GCC 3.3's allocator picks
+     * $a2 for it); it forces the register only, no code is added. */
+    register SceKernelMsgPacket *last asm("$5");
     SceKernelMsgPacket *message;
 
     oldK1 = pspShiftK1();
