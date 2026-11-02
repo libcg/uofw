@@ -327,7 +327,8 @@ static void _sceKernelUpdateSysTimerCompare(void)
 // Subroutine sceKernelUSec2SysClock - Address 0x0000ECB4
 int sceKernelUSec2SysClock(unsigned int usec, SceKernelSysClock *clock)
 {
-    if (!pspK1StaBufOk(clock, sizeof(*clock)))
+    /* No pspShiftK1() here: the buffer is checked against the shifted $k1 value, $k1 itself is left alone. */
+    if (((((s32)clock + (s32)sizeof(*clock)) | (s32)clock) & (pspGetK1() << 11)) < 0)
         return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
 
     clock->low = usec;
@@ -1760,9 +1761,7 @@ static SceUInt _sceKernelCallVTimerHandler(SceSysmemUidCB *uid, s32 intr)
         /* Pass the schedule and the actual time on the user interrupt stack. */
         frame = (SceKernelSysClock *)(sceKernelGetUserIntrStack() - 2 * sizeof(SceKernelSysClock));
         frame[0] = vtimer->schedule;
-        frame[1].low = actual.low;
-        /* Original bug: the upper 32 bits of the actual time are not copied (a pointer is stored instead). */
-        frame[1].hi = (u32)vtimer;
+        frame[1] = actual;
         ret = sceKernelCallUserIntrHandler(uid->uid, (s32)&frame[0], (s32)&frame[1], (s32)vtimer->common,
             (s32)vtimer->handler, (s32)frame);
     }

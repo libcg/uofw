@@ -11,7 +11,9 @@
 # Subroutine sub_00000000 - Address 0x00000000
 # The entry of the idle thread (see ThreadManInit()). Forever: write back some data cache lines, write 0x10100
 # to the hardware register 0xBC200000 and put the CPU to sleep, then restore the register and briefly enable
-# the interrupts. The instructions with no assembler mnemonic (sleep) are written as raw words.
+# the interrupts. The second written back line is pointed to by the first word of the exception manager's state
+# (ExcepManCB, a variable imported from ExceptionManagerForKernel). The instructions with no assembler mnemonic
+# (sleep) are written as raw words.
     .globl sub_00000000
 sub_00000000:
     jal         ExceptionManagerForKernel_96D47F7E
@@ -21,7 +23,7 @@ sub_00000000:
     mtic $zero, $0
     lui         $t3, 0x1
     ori         $t3, $t3, 0x100
-    lui         $t4, 0x0
+    lui         $t4, %hi(ExcepManCB)
     nop
     nop
     nop
@@ -31,7 +33,7 @@ sub_00000000:
     nop
     nop
 .L00040:
-    lw          $t6, 0x0($t4)
+    lw          $t6, %lo(ExcepManCB)($t4)
     mtc0        $v0, $25
     cache       0x0A, 0x0($v0)
     cache       0x0A, 0x40($v0)

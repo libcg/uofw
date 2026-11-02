@@ -317,8 +317,8 @@ s32 _sceKernelCleanerThreadEntry(SceSize args, void *argp)
     (void)args;
     (void)argp;
 
-    intr = sceKernelCpuSuspendIntr();
     for (;;) {
+        intr = sceKernelCpuSuspendIntr();
         deadThreads = &g_threadman.deadThreads;
         do {
             for (i = 0; i < deadThreads->count; i++) {
@@ -934,9 +934,11 @@ s32 sceKernelStartThread(SceUID thid, SceSize arglen, void *argp)
     thread->unk200 = sp;
     context->type = SCE_THREADMAN_CONTEXT_TYPE_FULL;
     context->gpr[26] = (u32)thread->k0;
-    if (THREADMAN_IS_USER_THREAD(thread))
-        thread->userSp = (u32)thread->kStackLow + thread->kStackSize;
-    else
+    if (THREADMAN_IS_USER_THREAD(thread)) {
+        /* User threads start in kernel mode, on the top of their kernel stack. */
+        sp = (u32)thread->kStackLow + thread->kStackSize;
+        thread->userSp = sp;
+    } else
         thread->userSp = 0;
     context->gpr[29] = sp;
     context->gpr[30] = context->gpr[29];
@@ -1080,6 +1082,7 @@ s32 sceKernelExitDeleteThread(s32 status)
 
     intr = sceKernelCpuSuspendIntr();
     THREADMAN_LOG(SCE_THREADMAN_LOG_EXIT_DELETE_THREAD, 1, status);
+    g_threadman.curThread->exitStatus = status;
     sub_000178C0(1, intr, g_threadman.curThread->exitStatus);
 }
 
@@ -3167,7 +3170,7 @@ void sub_000172F8(void)
         g_threadman.cleanerThread->status = SCE_THREADMAN_STATUS_RUNNING;
         g_threadman.nextThread = g_threadman.cleanerThread;
         if (curThread->status == SCE_THREADMAN_STATUS_RUNNING) {
-            threadmanReadyQueueAdd(curThread);
+            threadmanReadyQueueAddHead(curThread);
             curThread->status = SCE_THREADMAN_STATUS_READY;
         }
         return;
@@ -3188,7 +3191,7 @@ void sub_000172F8(void)
     } else if (prio < curThread->currentPriority) {
         thread = (SceThreadmanThread *)g_threadman.readyQueue[prio].next;
         threadmanReadyQueueRemove(thread, prio);
-        threadmanReadyQueueAdd(curThread);
+        threadmanReadyQueueAddHead(curThread);
         thread->status = SCE_THREADMAN_STATUS_RUNNING;
         g_threadman.nextThread = thread;
         curThread->status = SCE_THREADMAN_STATUS_READY;
@@ -3757,8 +3760,7 @@ static s32 _sceKernelThreadDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFu
     if (thread->vfpuContext != NULL) {
         if (g_threadman.vfpuOwner == thread->vfpuContext)
             g_threadman.vfpuOwner = NULL;
-        else
-            sub_000002C8();
+        sub_000002C8();
         sceKernelFreeHeapMemory(g_threadman.heapId, thread->vfpuContext);
     }
 

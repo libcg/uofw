@@ -734,7 +734,7 @@ static void _sceKernelMutexUnlock(SceSysmemUidCB *uid)
     threadmanListRemove(&mutex->ownerLink);
     first = (SceThreadmanMutex *)owner->ownedMutexes.next;
     if (&first->ownerLink != &owner->ownedMutexes) {
-        waitQ = UID_CB_TO_DATA((u32 *)first - g_threadman.mutexType->size, g_threadman.waitQType, SceThreadmanWaitQ);
+        waitQ = UID_CB_TO_DATA((SceSysmemUidCB *)((u32 *)first - g_threadman.mutexType->size), g_threadman.waitQType, SceThreadmanWaitQ);
         if (waitQ->attr & SCE_THREADMAN_MUTEX_ATTR_PRIORITY_CEILING) {
             /* The first owned mutex has the highest ceiling priority. */
             owner->mutexPriority = first->ceilingPriority;

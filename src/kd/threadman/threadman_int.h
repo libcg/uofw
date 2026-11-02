@@ -901,8 +901,12 @@ typedef struct SceThreadmanDeadThreads {
     s32 count; // 36
 } SceThreadmanDeadThreads; // size: 40
 
-/** Read by the dispatcher: if not NULL, it receives the $k0 register value of the next thread. */
-#define THREADMAN_K0_HOOK           (*(u32 **)0x00000000)
+/**
+ * The first word of the interrupt manager's state (intInfo, a variable imported from InterruptManagerForKernel).
+ * Read by the dispatcher: if not NULL, it receives the $k0 register value of the next thread.
+ */
+extern u32 *intInfo;
+#define THREADMAN_K0_HOOK           (intInfo)
 
 /** The number of thread priorities (and of ready queues). */
 #define SCE_THREADMAN_NUM_PRIORITIES    (128)
@@ -1095,6 +1099,19 @@ static inline void threadmanReadyQueueAdd(SceThreadmanThread *thread)
     prio = thread->currentPriority;
     threadmanListAddTail(&g_threadman.readyQueue[prio], &thread->link);
     g_threadman.readyBitmap[THREADMAN_READY_INDEX(prio)] |= THREADMAN_READY_BIT(prio);
+}
+
+/**
+ * Add a thread at the head of the ready queue of its current priority (a running thread which is
+ * preempted keeps its turn): it is inserted before the first entry of the queue.
+ */
+static inline void threadmanReadyQueueAddHead(SceThreadmanThread *thread)
+{
+    s32 prio;
+
+    prio = thread->currentPriority;
+    g_threadman.readyBitmap[THREADMAN_READY_INDEX(prio)] |= THREADMAN_READY_BIT(prio);
+    threadmanListAddTail(g_threadman.readyQueue[prio].next, &thread->link);
 }
 
 /** Get the highest priority (the lowest value) of the non-empty ready queues (128 if they are all empty). */
