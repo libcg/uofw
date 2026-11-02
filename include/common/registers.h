@@ -20,6 +20,10 @@ static inline int pspGetK0(void)
  */
 register int g_k1 __asm__("$27");
 
+/*
+ * PARITY-Q146: pspGetK1 is a macro reading g_k1 directly (was a static inline), and pspK1PtrOk
+ * reads it into a local first. Shared include/common change, approved by the user.
+ */
 #define pspGetK1() (g_k1)
 
 static inline void pspSetK1(int k1)

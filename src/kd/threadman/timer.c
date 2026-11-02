@@ -6,7 +6,8 @@
  * uOFW/trunk/src/kd/threadman/timer.c
  *
  * Timers: the system timer, the delay timers, the alarms, the virtual timers and the system time
- * (original address range 0x0000E5EC - 0x00011A24).
+ * (original address range 0x0000E5EC - 0x000112E0; the timers continue in timer_handler.c, 0x000112F8 -
+ * 0x00011A24, after sub_000112E0 in timer_syscall.S).
  *
  * The system time is a 64-bit microsecond counter: its lower 32 bits are the counter of the system
  * timer hardware and its upper 32 bits are kept in g_threadman.sysTimeBase, updated on every compare
@@ -33,40 +34,10 @@
 
 #include "threadman_int.h"
 
-/** The counter of the system timer (the lower 32 bits of the system time). */
-#define SYSTIMER_COUNTER    (0xBC600000)
-/** The compare register of the system timer (an interrupt is raised when the counter reaches it). */
-#define SYSTIMER_COMPARE    (0xBC600004)
-#define SYSTIMER_UNK8       (0xBC600008)
-#define SYSTIMER_UNKC       (0xBC60000C)
-#define SYSTIMER_UNK10      (0xBC600010)
-
-/** The period of the system timer overflow timer, in microseconds. */
-#define SYSTIMER_OVF_PERIOD (0xF0000000)
-
-/** The syscall / suspend / resume handler slot of the system timer. */
-#define SYSTIMER_HANDLER_ID (0x18)
-
 void sub_000112E0(void);
-static s32 _sceKernelSysTimerIntr(s32 unk, SceThreadman *threadman);
-static void _sceKernelInsertTimer(SceThreadmanTimer *timer);
-static void _sceKernelUpdateSysTimerCompare(void);
+static s32 _sceKernelSysTimerIntr(s32 intrNum, SceThreadman *threadman);
 u64 _sceKernelGetSystemTime64(void);
 static void _sceKernelFreeDelay(SceSysmemUidCB *uid);
-static s32 _sceKernelSysTimerSuspend(s32 unk, void *param);
-static s32 _sceKernelSysTimerResume(s32 unk, void *param);
-static void _sceKernelSysClockDivide(SceKernelSysClock *quot, SceKernelSysClock *clock, u32 div, unsigned int *rem);
-static SceUInt _sceKernelCallAlarmHandler(SceSysmemUidCB *uid, s32 intr);
-static SceUInt _sceKernelCallVTimerHandler(SceSysmemUidCB *uid, s32 intr);
-static SceUID _sceKernelSetAlarm(u64 clock, SceKernelAlarmHandler handler, void *common);
-static s32 _sceKernelDelayInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
-static s32 _sceKernelDelayDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
-static s32 _sceKernelAlarmInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
-static s32 _sceKernelAlarmDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
-static s32 _sceKernelVTimerInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
-static s32 _sceKernelVTimerDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
-static s32 _sceKernelTimerInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
-static s32 _sceKernelTimerDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 
 // 0x00019DD0
 SceSysmemUidLookupFunc g_DelayFuncs[] = {
@@ -96,20 +67,14 @@ SceSysmemUidLookupFunc g_TimerFuncs[] = {
     { 0, NULL }
 };
 
-// 0x00019F00
-/** The counter of the system timer, saved on suspend and restored on resume. */
-u32 g_sysTimerSavedCounter;
-
-/** Remove the active timer timer from the timer list (keeping the interrupt handler's iterator valid). */
-static inline void _sceKernelRemoveTimer(SceThreadmanTimer *timer)
-{
-    if (g_threadman.nextTimer == &timer->link)
-        g_threadman.nextTimer = timer->link.next;
-    threadmanListRemove(&timer->link);
-    timer->link.next = &timer->link;
-    timer->link.prev = &timer->link;
-}
-
+/*
+ * PARITY-Q039 (f6c063a): List heads initialised with threadmanListInit (the original's store pattern).
+ * PARITY-Q049 (36877a1): If/else statements instead of ternaries (the original branches, no movz/movn).
+ * PARITY-Q125: The g_threadman field stores are written in structure-offset order (unk2032/unk2036, then
+ *     minTimerDelay, minCompareDelay, getSystemTimeLow, getSystemTime). Prologue now matches. Alternative
+ *     (non-natural order minCompareDelay, getSystemTimeLow, getSystemTime, minTimerDelay) scores slightly higher.
+ * PARITY-Q161: The overflow timer's schedule is set with threadmanSysClockSet32() (equiv -> sched, size = orig).
+ */
 /**
  * Initialize the system timer and the timer list.
  */
@@ -122,14 +87,17 @@ void _sceKernelSysTimerInit(void)
     SceSysmemUidCB *uid;
     SceThreadmanTimer *timer;
 
-    g_threadman.unk2036 = 1;
     g_threadman.unk2032 = 1;
+    g_threadman.unk2036 = 1;
     sceKernelUSec2SysClock(100, &clock);
-    g_threadman.getSystemTime = _sceKernelGetSystemTime64;
+    g_threadman.minTimerDelay = clock.low;
     g_threadman.minCompareDelay = clock.low * 2;
     g_threadman.getSystemTimeLow = sceKernelGetSystemTimeLow;
-    g_threadman.minTimerDelay = clock.low;
-    g_threadman.sysTimerIntr = (g_threadman.cop0State22 != 0) ? 4 : 0x13;
+    g_threadman.getSystemTime = _sceKernelGetSystemTime64;
+    if (g_threadman.cop0State22 == 0)
+        g_threadman.sysTimerIntr = 0x13;
+    else
+        g_threadman.sysTimerIntr = 4;
 
     HW(SYSTIMER_UNKC) = 1;
     HW(SYSTIMER_UNK8) = 0x30;
@@ -139,10 +107,20 @@ void _sceKernelSysTimerInit(void)
     sceKernelRegisterIntrHandler(g_threadman.sysTimerIntr, 1, _sceKernelSysTimerIntr, &g_threadman, NULL);
     sceKernelSetIntrLevel(g_threadman.sysTimerIntr, 2);
 
-    g_threadman.freeDelays.prev = &g_threadman.freeDelays;
-    g_threadman.timers.prev = &g_threadman.timers;
-    g_threadman.freeDelays.next = &g_threadman.freeDelays;
-    g_threadman.timers.next = &g_threadman.timers;
+    /*
+     * PARITY-Q198 (source order): timers is initialised before freeDelays. In the natural
+     * order the freeDelays head chain closes after the hoisted %hi("SceThreadmanDelay") and
+     * regrename hands it $s4 (tick 0), which shifts the later %hi chains ($s4/$a3 -> $a3/$t0)
+     * and drops the lui $s4 out of the SetPrimarySyscallHandler delay slot.
+     *
+     * PARITY-Q201 (source form): the free delay loop counts up and threadmanListInit stores
+     * next before prev. loop.c reverses the count-up loop (i is only a counter; the original
+     * counts down to bgezl), and with that the i = 31 init no longer precedes the hoisted
+     * lui %hi("SceThreadmanDelay"): sched2 then emits lui $s4 before the freeDelays prev
+     * store and addiu $s2 after it, as in the original.
+     */
+    threadmanListInit(&g_threadman.timers);
+    threadmanListInit(&g_threadman.freeDelays);
     g_threadman.numFreeDelays = 0;
     g_threadman.nextTimer = NULL;
 
@@ -150,15 +128,19 @@ void _sceKernelSysTimerInit(void)
 
     /* The overflow timer, which keeps the upper 32 bits of the system time up to date. */
     sceKernelCreateUID(g_threadman.timerType, "SceThreadmanSysTimerOVF", 0, &uid);
-    timer = UID_CB_TO_DATA(uid, g_threadman.timerType, SceThreadmanTimer);
-    timer->schedule.hi = 0;
-    timer->schedule.low = SYSTIMER_OVF_PERIOD;
-    g_threadman.sysTimeBase.hi = 0;
-    g_threadman.sysTimeBase.low = 0;
-    g_threadman.nextCompare = timer->schedule;
+    timer = UID_CB_TO_DATA(uid, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
+    threadmanSysClockSet32(&timer->schedule, SYSTIMER_OVF_PERIOD);
+    threadmanSysClockSet32(&g_threadman.sysTimeBase, 0);
+    /*
+     * PARITY-Q197 (source order): the overflow timer is linked into the timers list
+     * before nextCompare is copied from its schedule. With the copy first, sched1's
+     * register-weight rule puts entry->prev->next = entry ahead of the nextCompare.hi
+     * store and ListAddTail's $t1/$t2/$t3 come out permuted against the original.
+     */
     threadmanListAddTail(&g_threadman.timers, &timer->link);
+    g_threadman.nextCompare = timer->schedule;
 
-    for (i = SCE_THREADMAN_MAX_FREE_DELAYS - 1; i >= 0; i--) {
+    for (i = 0; i < SCE_THREADMAN_MAX_FREE_DELAYS; i++) {
         sceKernelCreateUID(g_threadman.delayType, "SceThreadmanDelay", 0, &uid);
         _sceKernelFreeDelay(uid);
     }
@@ -176,16 +158,21 @@ void _sceKernelSysTimerInit(void)
     sceKernelCpuResumeIntr(intr);
 }
 
+/*
+ * PARITY-Q088: The alarm re-arm adds the clamped delay directly (`schedule += delay < min ? min : delay;`) instead
+ *     of reassigning delay (the original's movz into the minTimerDelay register).
+ */
 /**
  * The interrupt handler of the system timer: run the expired timers.
  *
- * @param unk Unknown.
+ * @param intrNum The interrupt number (the interrupt manager passes it in $a0 to a main interrupt handler,
+ * as modelled by PPSSPP's IntrHandler::copyArgsToCPU()).
  * @param threadman The global state of the thread manager.
  *
  * @return -1.
  */
 // Subroutine sub_0000E80C - Address 0x0000E80C
-static s32 _sceKernelSysTimerIntr(s32 unk, SceThreadman *threadman)
+static s32 _sceKernelSysTimerIntr(s32 intrNum, SceThreadman *threadman)
 {
     s32 intr;
     u32 delay;
@@ -197,7 +184,7 @@ static s32 _sceKernelSysTimerIntr(s32 unk, SceThreadman *threadman)
     SceThreadmanVTimer *vtimer;
     SceSysmemUidCB *uid;
 
-    (void)unk;
+    (void)intrNum;
 
     intr = sceKernelCpuSuspendIntr();
 
@@ -206,7 +193,7 @@ static s32 _sceKernelSysTimerIntr(s32 unk, SceThreadman *threadman)
 
     for (entry = threadman->timers.next; entry != &threadman->timers; entry = threadman->nextTimer) {
         timer = (SceThreadmanTimer *)entry;
-        schedule = THREADMAN_SYSCLOCK_GET(timer->schedule);
+        schedule = threadmanSysClockGet(&timer->schedule);
         threadman->nextTimer = entry->next;
         if ((s64)(schedule - now) > 0)
             break;
@@ -215,7 +202,7 @@ static s32 _sceKernelSysTimerIntr(s32 unk, SceThreadman *threadman)
         timer->link.next = &timer->link;
         timer->link.prev = &timer->link;
 
-        uid = THREADMAN_UID_DATA_TO_CB(timer, g_threadman.timerType);
+        uid = THREADMAN_UID_DATA_TO_CB(timer, ((SceSysmemUidCB *)g_threadman.timerType));
         if (sceKernelIsKindOf(uid, g_threadman.delayType)) {
             delayTimer = UID_CB_TO_DATA(uid, g_threadman.delayType, SceThreadmanDelay);
             sceKernelCpuResumeIntr(intr);
@@ -229,10 +216,8 @@ static s32 _sceKernelSysTimerIntr(s32 unk, SceThreadman *threadman)
                 timer->deletePending = 1;
                 sub_000126AC(uid->uid);
             } else {
-                if (delay < threadman->minTimerDelay)
-                    delay = threadman->minTimerDelay;
-                schedule += delay;
-                THREADMAN_SYSCLOCK_SET(timer->schedule, schedule);
+                schedule += (delay < threadman->minTimerDelay) ? threadman->minTimerDelay : delay;
+                threadmanSysClockSet(&timer->schedule, schedule);
                 _sceKernelInsertTimer(timer);
             }
         } else if (sceKernelIsKindOf(uid, g_threadman.vtimerType)) {
@@ -244,15 +229,15 @@ static s32 _sceKernelSysTimerIntr(s32 unk, SceThreadman *threadman)
                 if (delay < threadman->minTimerDelay)
                     delay = threadman->minTimerDelay;
                 schedule += delay;
-                THREADMAN_SYSCLOCK_SET(timer->schedule, schedule);
-                schedule = THREADMAN_SYSCLOCK_GET(vtimer->schedule) + delay;
-                THREADMAN_SYSCLOCK_SET(vtimer->schedule, schedule);
+                threadmanSysClockSet(&timer->schedule, schedule);
+                schedule = threadmanSysClockGet(&vtimer->schedule) + delay;
+                threadmanSysClockSet(&vtimer->schedule, schedule);
                 _sceKernelInsertTimer(timer);
             }
         } else {
             /* The overflow timer. */
             schedule += SYSTIMER_OVF_PERIOD;
-            THREADMAN_SYSCLOCK_SET(timer->schedule, schedule);
+            threadmanSysClockSet(&timer->schedule, schedule);
             _sceKernelInsertTimer(timer);
         }
     }
@@ -264,18 +249,31 @@ static s32 _sceKernelSysTimerIntr(s32 unk, SceThreadman *threadman)
     return -1;
 }
 
+/*
+ * PARITY-Q050 (7957ad3): Loop shape (guarded block instead of continue / separate next cursor / head pointer walk) as
+ *     the original's layout.
+ * PARITY-Q051 (7957ad3): Access through a local/named pointer (the original's addressing).
+ * PARITY-Q119: the schedule pointer is a local declared in the loop body, not set once before the loop. Its
+ *     address is then recomputed inside the loop and hoisted only late, so the low word is read through timer
+ *     (lw 0x8(timer)) and the high word through the pointer, and `move timer` fills the beq delay slot, as in
+ *     the original. equiv -> exact. An assignment in the loop to a function-scope pointer matches the same way.
+ *     Rejected: dropping the pointer (down), and swapping the head/schedule assignments (0).
+ */
 /**
  * Insert a timer in the timer list, after the timers expiring before or at the same time.
  *
  * @param timer The timer to insert.
  */
 // Subroutine sub_0000EAE0 - Address 0x0000EAE0
-static void _sceKernelInsertTimer(SceThreadmanTimer *timer)
+void _sceKernelInsertTimer(SceThreadmanTimer *timer)
 {
     SceThreadmanListEntry *entry;
+    SceThreadmanListEntry *head;
 
-    for (entry = g_threadman.timers.next; entry != &g_threadman.timers; entry = entry->next) {
-        if (THREADMAN_SYSCLOCK_GET(timer->schedule) < THREADMAN_SYSCLOCK_GET(((SceThreadmanTimer *)entry)->schedule))
+    head = &g_threadman.timers;
+    for (entry = head->next; entry != head; entry = entry->next) {
+        SceKernelSysClock *schedule = &timer->schedule;
+        if (THREADMAN_SYSCLOCK_GET(*schedule) < THREADMAN_SYSCLOCK_GET(((SceThreadmanTimer *)entry)->schedule))
             break;
     }
     timer->link.next = entry;
@@ -284,6 +282,16 @@ static void _sceKernelInsertTimer(SceThreadmanTimer *timer)
     timer->link.prev->next = &timer->link;
 }
 
+/*
+ * PARITY-Q025: Uses nextCompare volatile.
+ * PARITY-Q050 (a5da7c8): Loop shape (guarded block instead of continue / separate next cursor / head pointer walk) as
+ *     the original's layout.
+ * PARITY-Q051 (d2ad177): Access through a local/named pointer (the original's addressing).
+ * PARITY-Q120: the first schedule is read through head->next, and entry is set in the for init, not assigned
+ *     before. The first timer's address and the loop cursor are then separate values, which gives the original's
+ *     register assignment for the loop. equiv -> exact. Assigning `entry = head->next;` after the schedule read
+ *     matches the same way; the for init is closer to natural source.
+ */
 /**
  * Program the compare register of the system timer for the next timer to expire.
  *
@@ -291,17 +299,19 @@ static void _sceKernelInsertTimer(SceThreadmanTimer *timer)
  * them), and the compare is never set too close to the current time.
  */
 // Subroutine sub_0000EB7C - Address 0x0000EB7C
-static void _sceKernelUpdateSysTimerCompare(void)
+void _sceKernelUpdateSysTimerCompare(void)
 {
     u64 schedule;
     u64 limit;
     u64 now;
     SceThreadmanListEntry *entry;
+    SceThreadmanListEntry *head;
+    SceKernelSysClock *nextCompare;
 
-    entry = g_threadman.timers.next;
-    schedule = THREADMAN_SYSCLOCK_GET(((SceThreadmanTimer *)entry)->schedule);
+    head = &g_threadman.timers;
+    schedule = THREADMAN_SYSCLOCK_GET(((SceThreadmanTimer *)head->next)->schedule);
     limit = schedule + g_threadman.minCompareDelay;
-    for (; entry != &g_threadman.timers; entry = entry->next) {
+    for (entry = head->next; entry != head; entry = entry->next) {
         if ((s64)(limit - THREADMAN_SYSCLOCK_GET(((SceThreadmanTimer *)entry)->schedule)) <= 0)
             break;
         schedule = THREADMAN_SYSCLOCK_GET(((SceThreadmanTimer *)entry)->schedule);
@@ -311,7 +321,8 @@ static void _sceKernelUpdateSysTimerCompare(void)
     if ((s64)(schedule - now) < (s64)g_threadman.minCompareDelay)
         schedule = now + g_threadman.minCompareDelay;
 
-    THREADMAN_SYSCLOCK_SET(g_threadman.nextCompare, schedule);
+    nextCompare = (SceKernelSysClock *)&g_threadman.nextCompare;
+    THREADMAN_SYSCLOCK_SET(*nextCompare, schedule);
     HW(SYSTIMER_COMPARE) = (u32)schedule;
     pspSync();
 }
@@ -353,6 +364,9 @@ u64 _sceKernelGetSystemTime64(void)
     return ((u64)hi << 32) + low;
 }
 
+/*
+ * PARITY-Q054 (4f442e8): Comparison operand order as the original's branch operands.
+ */
 /**
  * Cancel an alarm.
  *
@@ -372,7 +386,7 @@ int sceKernelCancelAlarm(SceUID alarmid)
     oldK1 = pspShiftK1();
 
     /* An alarm cannot be cancelled from its own handler (return 0 from it instead). */
-    if (alarmid == g_threadman.curTimerUid) {
+    if (g_threadman.curTimerUid == alarmid) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_NOT_FOUND_ALARM;
     }
@@ -392,7 +406,7 @@ int sceKernelCancelAlarm(SceUID alarmid)
 
     THREADMAN_LOG(SCE_THREADMAN_LOG_CANCEL_ALARM, 1, alarmid);
 
-    timer = UID_CB_TO_DATA(uid, g_threadman.timerType, SceThreadmanTimer);
+    timer = UID_CB_TO_DATA(uid, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     if (timer->deletePending) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
@@ -424,7 +438,7 @@ static void _sceKernelFreeDelay(SceSysmemUidCB *uid)
     s32 numFreeDelays;
     SceThreadmanTimer *timer;
 
-    timer = UID_CB_TO_DATA(uid, g_threadman.timerType, SceThreadmanTimer);
+    timer = UID_CB_TO_DATA(uid, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     numFreeDelays = g_threadman.numFreeDelays;
     if (numFreeDelays < SCE_THREADMAN_MAX_FREE_DELAYS) {
         threadmanListAddTail(&g_threadman.freeDelays, &timer->link);
@@ -448,7 +462,6 @@ int sceKernelReferAlarmStatus(SceUID alarmid, SceKernelAlarmInfo *info)
 {
     s32 oldK1;
     s32 intr;
-    u32 *ptr;
     SceSysmemUidCB *uid;
     SceThreadmanTimer *timer;
     SceThreadmanAlarm *alarm;
@@ -476,21 +489,24 @@ int sceKernelReferAlarmStatus(SceUID alarmid, SceKernelAlarmInfo *info)
     THREADMAN_LOG(SCE_THREADMAN_LOG_REFER_ALARM_STATUS, 2, alarmid, info);
 
     alarm = UID_CB_TO_DATA(uid, g_threadman.alarmType, SceThreadmanAlarm);
-    timer = UID_CB_TO_DATA(uid, g_threadman.timerType, SceThreadmanTimer);
+    timer = UID_CB_TO_DATA(uid, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     buf = &g_threadman.statusBuf.alarmInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     buf->schedule = timer->schedule;
     buf->handler = alarm->handler;
     buf->common = alarm->common;
-    memcpy(info, buf, (buf->size < info->size) ? buf->size : info->size);
+    THREADMAN_COPY_STATUS(info, &g_threadman.statusBuf.alarmInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q042 (3b11026): Statement/store order taken from the original's store order.
+ */
 /**
  * Create a virtual timer.
  *
@@ -527,8 +543,8 @@ SceUID sceKernelCreateVTimer(const char *name, SceKernelVTimerOptParam *opt)
     intr = sceKernelCpuSuspendIntr();
 
     vtimer = UID_CB_TO_DATA(uid, g_threadman.vtimerType, SceThreadmanVTimer);
-    vtimer->handler = NULL;
     vtimer->active = 0;
+    vtimer->handler = NULL;
 
     THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_VTIMER, 1, uid->uid);
 
@@ -579,6 +595,9 @@ int sceKernelDeleteVTimer(SceUID uid)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q042 (4fb02df): Statement/store order taken from the original's store order.
+ */
 /**
  * Get the base of a virtual timer (the system time at which it was virtually started).
  *
@@ -617,18 +636,28 @@ int sceKernelGetVTimerBase(SceUID uid, SceKernelSysClock *base)
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
     if (vtimer->active)
         *base = vtimer->base;
-    else {
-        base->low = 0;
-        base->hi = 0;
-    }
+    else
+        threadmanSysClockSet32(base, 0);
 
-    THREADMAN_LOG(SCE_THREADMAN_LOG_GET_VTIMER_BASE, 3, uid, base->low, base->hi);
+    THREADMAN_LOG(SCE_THREADMAN_LOG_GET_VTIMER_BASE, 3, uid, base->hi, base->low);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q072: Success path inside the then-block of a positive UID/permission check, shared error tail after it
+ * (the original's layout: error return out of line at the end).
+ * PARITY-Q040: Permission check as its own if with its own error return inside the UID check (the original's
+ *     block count keeps the log call setup in its own block).
+ * PARITY-Q080: base assigned in both arms of an if/else instead of pre-set to 0 (the original's block layout and
+ *     instruction count).
+ * PARITY-Q122: UID lookup failure handled first with an early return (the success path follows a jump target).
+ *     The label starts a new cselib table in postreload, so the log handler address is rebuilt from the kept
+ *     %hi register (lui/addiu pair) instead of being copied from the vtimerType pointer register. Q040's
+ *     permission check is now its own if after the lookup check rather than nested inside it.
+ */
 /**
  * Get the base of a virtual timer (the system time at which it was virtually started).
  *
@@ -649,17 +678,21 @@ SceInt64 sceKernelGetVTimerBaseWide(SceUID uid)
 
     intr = sceKernelCpuSuspendIntr();
 
-    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.vtimerType, &cb) != SCE_ERROR_OK
-        || !THREADMAN_UID_PERM_OK(cb, SCE_THREADMAN_UID_ATTR_REFER)) {
+    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.vtimerType, &cb) != SCE_ERROR_OK) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return -1;
     }
-
-    base = 0;
+    if (!THREADMAN_UID_PERM_OK(cb, SCE_THREADMAN_UID_ATTR_REFER)) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return -1;
+    }
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
     if (vtimer->active)
-        base = THREADMAN_SYSCLOCK_GET(vtimer->base);
+        base = threadmanSysClockGet(&vtimer->base);
+    else
+        base = 0;
 
     THREADMAN_LOG(SCE_THREADMAN_LOG_GET_VTIMER_BASE_WIDE, 2, uid, (u32)base);
 
@@ -668,6 +701,9 @@ SceInt64 sceKernelGetVTimerBaseWide(SceUID uid)
     return base;
 }
 
+/*
+ * PARITY-Q042 (e0d596d): Statement/store order taken from the original's store order.
+ */
 /**
  * Get the current time of a virtual timer.
  *
@@ -706,18 +742,24 @@ int sceKernelGetVTimerTime(SceUID uid, SceKernelSysClock *time)
 
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
     if (vtimer->active) {
-        now = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(vtimer->base);
-        THREADMAN_SYSCLOCK_SET(*time, now);
+        now = _sceKernelGetSystemTime64() - threadmanSysClockGet(&vtimer->base);
+        threadmanSysClockSet(time, now);
     } else
         *time = vtimer->base;
 
-    THREADMAN_LOG(SCE_THREADMAN_LOG_GET_VTIMER_TIME, 3, uid, time->low, time->hi);
+    THREADMAN_LOG(SCE_THREADMAN_LOG_GET_VTIMER_TIME, 3, uid, time->hi, time->low);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q072: Success path inside the then-block of a positive UID/permission check, shared error tail after it
+ * (the original's layout: error return out of line at the end).
+ * PARITY-Q040: Permission check as its own if with its own error return inside the UID check (the original's
+ *     block count keeps the log call setup in its own block).
+ */
 /**
  * Get the current time of a virtual timer.
  *
@@ -738,26 +780,35 @@ SceInt64 sceKernelGetVTimerTimeWide(SceUID uid)
 
     intr = sceKernelCpuSuspendIntr();
 
-    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.vtimerType, &cb) != SCE_ERROR_OK
-        || !THREADMAN_UID_PERM_OK(cb, SCE_THREADMAN_UID_ATTR_REFER)) {
+    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.vtimerType, &cb) == SCE_ERROR_OK) {
+        if (!THREADMAN_UID_PERM_OK(cb, SCE_THREADMAN_UID_ATTR_REFER)) {
+            sceKernelCpuResumeIntr(intr);
+            pspSetK1(oldK1);
+            return -1;
+        }
+        vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
+        if (vtimer->active)
+            time = _sceKernelGetSystemTime64() - threadmanSysClockGet(&vtimer->base);
+        else
+            time = threadmanSysClockGet(&vtimer->base);
+
+        THREADMAN_LOG(SCE_THREADMAN_LOG_GET_VTIMER_TIME_WIDE, 2, uid, (u32)time);
+
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
-        return -1;
+        return time;
     }
-
-    vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
-    if (vtimer->active)
-        time = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(vtimer->base);
-    else
-        time = THREADMAN_SYSCLOCK_GET(vtimer->base);
-
-    THREADMAN_LOG(SCE_THREADMAN_LOG_GET_VTIMER_TIME_WIDE, 2, uid, (u32)time);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
-    return time;
+    return -1;
 }
 
+/*
+ * PARITY-Q065 (0cfff40): active arm first (the original's block layout and register choice).
+ * PARITY-Q088: The rescheduled expiry goes into its own `schedule` local instead of reusing `base` (separate
+ *     lifetimes give the original's register assignment).
+ */
 /**
  * Set the current time of a virtual timer.
  *
@@ -773,6 +824,7 @@ int sceKernelSetVTimerTime(SceUID uid, SceKernelSysClock *time)
     s32 intr;
     u64 old;
     u64 base;
+    u64 schedule;
     SceSysmemUidCB *cb;
     SceThreadmanVTimer *vtimer;
     SceThreadmanTimer *timer;
@@ -803,29 +855,36 @@ int sceKernelSetVTimerTime(SceUID uid, SceKernelSysClock *time)
     THREADMAN_LOG(SCE_THREADMAN_LOG_SET_VTIMER_TIME, 3, uid, time->hi, time->low);
 
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
-    timer = UID_CB_TO_DATA(cb, g_threadman.timerType, SceThreadmanTimer);
-    if (!vtimer->active) {
-        old = THREADMAN_SYSCLOCK_GET(vtimer->base);
-        vtimer->base = *time;
-    } else {
-        old = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(vtimer->base);
-        base = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(*time);
-        THREADMAN_SYSCLOCK_SET(vtimer->base, base);
+    timer = UID_CB_TO_DATA(cb, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
+    if (vtimer->active) {
+        old = _sceKernelGetSystemTime64() - threadmanSysClockGet(&vtimer->base);
+        base = _sceKernelGetSystemTime64() - threadmanSysClockGet(time);
+        threadmanSysClockSet(&vtimer->base, base);
         if (vtimer->handler != NULL) {
             _sceKernelRemoveTimer(timer);
-            base = THREADMAN_SYSCLOCK_GET(vtimer->schedule) + THREADMAN_SYSCLOCK_GET(vtimer->base);
-            THREADMAN_SYSCLOCK_SET(timer->schedule, base);
+            schedule = threadmanSysClockGet(&vtimer->schedule) + threadmanSysClockGet(&vtimer->base);
+            threadmanSysClockSet(&timer->schedule, schedule);
             _sceKernelInsertTimer(timer);
             _sceKernelUpdateSysTimerCompare();
         }
+    } else {
+        old = threadmanSysClockGet(&vtimer->base);
+        vtimer->base = *time;
     }
-    THREADMAN_SYSCLOCK_SET(*time, old);
+    threadmanSysClockSet(time, old);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q072: Success path inside the then-block of a positive UID/permission check, shared error tail after it
+ * (the original's layout: error return out of line at the end).
+ * PARITY-Q040: Permission check as its own if with its own error return inside the UID check (the original's
+ *     block count keeps the log call setup in its own block).
+ * PARITY-Q065 (0cfff40): active arm first (the original's block layout and register choice).
+ */
 /**
  * Set the current time of a virtual timer.
  *
@@ -853,38 +912,48 @@ SceInt64 sceKernelSetVTimerTimeWide(SceUID uid, SceInt64 time)
 
     intr = sceKernelCpuSuspendIntr();
 
-    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.vtimerType, &cb) != SCE_ERROR_OK
-        || !THREADMAN_UID_PERM_OK(cb, SCE_THREADMAN_UID_ATTR_SIGNAL)) {
+    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.vtimerType, &cb) == SCE_ERROR_OK) {
+        if (!THREADMAN_UID_PERM_OK(cb, SCE_THREADMAN_UID_ATTR_SIGNAL)) {
+            sceKernelCpuResumeIntr(intr);
+            pspSetK1(oldK1);
+            return -1;
+        }
+        THREADMAN_LOG(SCE_THREADMAN_LOG_SET_VTIMER_TIME_WIDE, 2, uid, (u32)time);
+
+        vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
+        timer = UID_CB_TO_DATA(cb, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
+        if (vtimer->active) {
+            old = _sceKernelGetSystemTime64() - threadmanSysClockGet(&vtimer->base);
+            base = _sceKernelGetSystemTime64() - time;
+            threadmanSysClockSet(&vtimer->base, base);
+            if (vtimer->handler != NULL) {
+                _sceKernelRemoveTimer(timer);
+                base = threadmanSysClockGet(&vtimer->schedule) + threadmanSysClockGet(&vtimer->base);
+                threadmanSysClockSet(&timer->schedule, base);
+                _sceKernelInsertTimer(timer);
+                _sceKernelUpdateSysTimerCompare();
+            }
+        } else {
+            old = threadmanSysClockGet(&vtimer->base);
+            threadmanSysClockSet(&vtimer->base, time);
+        }
+
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
-        return -1;
-    }
-
-    THREADMAN_LOG(SCE_THREADMAN_LOG_SET_VTIMER_TIME_WIDE, 2, uid, (u32)time);
-
-    vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
-    timer = UID_CB_TO_DATA(cb, g_threadman.timerType, SceThreadmanTimer);
-    if (!vtimer->active) {
-        old = THREADMAN_SYSCLOCK_GET(vtimer->base);
-        THREADMAN_SYSCLOCK_SET(vtimer->base, time);
-    } else {
-        old = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(vtimer->base);
-        base = _sceKernelGetSystemTime64() - time;
-        THREADMAN_SYSCLOCK_SET(vtimer->base, base);
-        if (vtimer->handler != NULL) {
-            _sceKernelRemoveTimer(timer);
-            base = THREADMAN_SYSCLOCK_GET(vtimer->schedule) + THREADMAN_SYSCLOCK_GET(vtimer->base);
-            THREADMAN_SYSCLOCK_SET(timer->schedule, base);
-            _sceKernelInsertTimer(timer);
-            _sceKernelUpdateSysTimerCompare();
-        }
+        return old;
     }
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
-    return old;
+    return -1;
 }
 
+
+/*
+ * PARITY-Q054 (4f442e8): Comparison operand order as the original's branch operands.
+ * PARITY-Q080 (86f7e58): ret assigned in both arms of an if/else instead of pre-set to 1 (the original
+ *     materializes the active = 1 store constant separately from the return value).
+ */
 /**
  * Start a virtual timer.
  *
@@ -898,13 +967,12 @@ int sceKernelStartVTimer(SceUID uid)
     s32 oldK1;
     s32 intr;
     s32 ret;
-    u64 time;
     SceSysmemUidCB *cb;
     SceThreadmanVTimer *vtimer;
     SceThreadmanTimer *timer;
 
     oldK1 = pspShiftK1();
-    if (uid == g_threadman.curTimerUid) {
+    if (g_threadman.curTimerUid == uid) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_VTIMER;
     }
@@ -925,16 +993,15 @@ int sceKernelStartVTimer(SceUID uid)
     THREADMAN_LOG(SCE_THREADMAN_LOG_START_VTIMER, 1, uid);
 
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
-    timer = UID_CB_TO_DATA(cb, g_threadman.timerType, SceThreadmanTimer);
-    ret = 1;
-    if (!vtimer->active) {
+    timer = UID_CB_TO_DATA(cb, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
+    if (vtimer->active)
+        ret = 1;
+    else {
         vtimer->active = 1;
         ret = 0;
-        time = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(vtimer->base);
-        THREADMAN_SYSCLOCK_SET(vtimer->base, time);
+        threadmanSysClockSet(&vtimer->base, _sceKernelGetSystemTime64() - threadmanSysClockGet(&vtimer->base));
         if (vtimer->handler != NULL) {
-            time = THREADMAN_SYSCLOCK_GET(vtimer->schedule) + THREADMAN_SYSCLOCK_GET(vtimer->base);
-            THREADMAN_SYSCLOCK_SET(timer->schedule, time);
+            threadmanSysClockSet(&timer->schedule, threadmanSysClockGet(&vtimer->schedule) + threadmanSysClockGet(&vtimer->base));
             _sceKernelInsertTimer(timer);
             _sceKernelUpdateSysTimerCompare();
         }
@@ -945,6 +1012,9 @@ int sceKernelStartVTimer(SceUID uid)
     return ret;
 }
 
+/*
+ * PARITY-Q054 (4f442e8): Comparison operand order as the original's branch operands.
+ */
 /**
  * Stop a virtual timer.
  *
@@ -958,13 +1028,12 @@ int sceKernelStopVTimer(SceUID uid)
     s32 oldK1;
     s32 intr;
     s32 ret;
-    u64 time;
     SceSysmemUidCB *cb;
     SceThreadmanVTimer *vtimer;
     SceThreadmanTimer *timer;
 
     oldK1 = pspShiftK1();
-    if (uid == g_threadman.curTimerUid) {
+    if (g_threadman.curTimerUid == uid) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_VTIMER;
     }
@@ -985,13 +1054,12 @@ int sceKernelStopVTimer(SceUID uid)
     THREADMAN_LOG(SCE_THREADMAN_LOG_STOP_VTIMER, 1, uid);
 
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
-    timer = UID_CB_TO_DATA(cb, g_threadman.timerType, SceThreadmanTimer);
+    timer = UID_CB_TO_DATA(cb, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     ret = 0;
     if (vtimer->active) {
         vtimer->active = 0;
         ret = 1;
-        time = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(vtimer->base);
-        THREADMAN_SYSCLOCK_SET(vtimer->base, time);
+        threadmanSysClockSet(&vtimer->base, _sceKernelGetSystemTime64() - threadmanSysClockGet(&vtimer->base));
         if (vtimer->handler != NULL) {
             _sceKernelRemoveTimer(timer);
             _sceKernelUpdateSysTimerCompare();
@@ -1003,6 +1071,11 @@ int sceKernelStopVTimer(SceUID uid)
     return ret;
 }
 
+/*
+ * PARITY-Q040: Separate ifs for the early checks: the kernel-mode handler address check is its own branch, as in
+ * sceKernelSetVTimerHandlerWide.
+ * PARITY-Q054 (4f442e8): Comparison operand order as the original's branch operands.
+ */
 /**
  * Set the handler of a virtual timer.
  *
@@ -1025,12 +1098,15 @@ int sceKernelSetVTimerHandler(SceUID uid, SceKernelSysClock *time, SceKernelVTim
     SceThreadmanTimer *timer;
 
     oldK1 = pspShiftK1();
-    if (uid == g_threadman.curTimerUid) {
+    if (g_threadman.curTimerUid == uid) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_VTIMER;
     }
-    if (!pspK1StaBufOk(time, sizeof(*time)) || !pspK1PtrOk(handler)
-        || (!pspK1IsUserMode() && (s32)handler >= 0)) {
+    if (!pspK1StaBufOk(time, sizeof(*time)) || !pspK1PtrOk(handler)) {
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
+    }
+    if (!pspK1IsUserMode() && (s32)handler >= 0) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
     }
@@ -1051,7 +1127,7 @@ int sceKernelSetVTimerHandler(SceUID uid, SceKernelSysClock *time, SceKernelVTim
     THREADMAN_LOG(SCE_THREADMAN_LOG_SET_VTIMER_HANDLER, 5, uid, time->hi, time->low, handler, common);
 
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
-    timer = UID_CB_TO_DATA(cb, g_threadman.timerType, SceThreadmanTimer);
+    timer = UID_CB_TO_DATA(cb, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     if (vtimer->active && vtimer->handler != NULL)
         _sceKernelRemoveTimer(timer);
 
@@ -1062,10 +1138,10 @@ int sceKernelSetVTimerHandler(SceUID uid, SceKernelSysClock *time, SceKernelVTim
         vtimer->isUser = pspK1IsUserMode();
         vtimer->gp = sceKernelGetModuleGPByAddressForKernel((u32)handler);
         if (vtimer->gp == 0)
-            vtimer->gp = pspGetGp();
+            vtimer->gp = threadmanGetGp();
         if (vtimer->active) {
-            schedule = THREADMAN_SYSCLOCK_GET(vtimer->schedule) + THREADMAN_SYSCLOCK_GET(vtimer->base);
-            THREADMAN_SYSCLOCK_SET(timer->schedule, schedule);
+            schedule = threadmanSysClockGet(&vtimer->schedule) + threadmanSysClockGet(&vtimer->base);
+            threadmanSysClockSet(&timer->schedule, schedule);
             _sceKernelInsertTimer(timer);
         }
     }
@@ -1077,6 +1153,10 @@ int sceKernelSetVTimerHandler(SceUID uid, SceKernelSysClock *time, SceKernelVTim
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q054 (4f442e8): Comparison operand order as the original's branch operands.
+ */
 /**
  * Set the handler of a virtual timer.
  *
@@ -1100,11 +1180,15 @@ int sceKernelSetVTimerHandlerWide(SceUID uid, SceInt64 time, SceKernelVTimerHand
     SceThreadmanTimer *timer;
 
     oldK1 = pspShiftK1();
-    if (uid == g_threadman.curTimerUid) {
+    if (g_threadman.curTimerUid == uid) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_VTIMER;
     }
-    if (!pspK1PtrOk(handler) || (!pspK1IsUserMode() && (s32)handler >= 0)) {
+    if (!pspK1PtrOk(handler)) {
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
+    }
+    if (!pspK1IsUserMode() && (s32)handler >= 0) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
     }
@@ -1125,19 +1209,19 @@ int sceKernelSetVTimerHandlerWide(SceUID uid, SceInt64 time, SceKernelVTimerHand
     THREADMAN_LOG(SCE_THREADMAN_LOG_SET_VTIMER_HANDLER_WIDE, 4, uid, (u32)time, handler, common);
 
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
-    timer = UID_CB_TO_DATA(cb, g_threadman.timerType, SceThreadmanTimer);
+    timer = UID_CB_TO_DATA(cb, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     if (vtimer->active && vtimer->handler != NULL)
         _sceKernelRemoveTimer(timer);
 
     vtimer->handler = (SceKernelVTimerHandler)(void *)handler;
     if (handler != NULL) {
-        THREADMAN_SYSCLOCK_SET(vtimer->schedule, time);
+        threadmanSysClockSet(&vtimer->schedule, time);
         vtimer->common = common;
         vtimer->isUser = pspK1IsUserMode();
-        vtimer->gp = pspGetGp();
+        vtimer->gp = threadmanGetGp();
         if (vtimer->active) {
-            schedule = THREADMAN_SYSCLOCK_GET(vtimer->schedule) + THREADMAN_SYSCLOCK_GET(vtimer->base);
-            THREADMAN_SYSCLOCK_SET(timer->schedule, schedule);
+            schedule = threadmanSysClockGet(&vtimer->schedule) + threadmanSysClockGet(&vtimer->base);
+            threadmanSysClockSet(&timer->schedule, schedule);
             _sceKernelInsertTimer(timer);
         }
     }
@@ -1149,6 +1233,9 @@ int sceKernelSetVTimerHandlerWide(SceUID uid, SceInt64 time, SceKernelVTimerHand
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q054 (4f442e8): Comparison operand order as the original's branch operands.
+ */
 /**
  * Cancel the handler of a virtual timer.
  *
@@ -1166,7 +1253,7 @@ int sceKernelCancelVTimerHandler(SceUID uid)
     SceThreadmanTimer *timer;
 
     oldK1 = pspShiftK1();
-    if (uid == g_threadman.curTimerUid) {
+    if (g_threadman.curTimerUid == uid) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_VTIMER;
     }
@@ -1187,7 +1274,7 @@ int sceKernelCancelVTimerHandler(SceUID uid)
     THREADMAN_LOG(SCE_THREADMAN_LOG_CANCEL_VTIMER_HANDLER, 1, uid);
 
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
-    timer = UID_CB_TO_DATA(cb, g_threadman.timerType, SceThreadmanTimer);
+    timer = UID_CB_TO_DATA(cb, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     if (vtimer->active && vtimer->handler != NULL) {
         _sceKernelRemoveTimer(timer);
         _sceKernelUpdateSysTimerCompare();
@@ -1212,8 +1299,6 @@ int sceKernelReferVTimerStatus(SceUID uid, SceKernelVTimerInfo *info)
 {
     s32 oldK1;
     s32 intr;
-    u64 time;
-    u32 *ptr;
     SceSysmemUidCB *cb;
     SceThreadmanVTimer *vtimer;
     SceKernelVTimerInfo *buf;
@@ -1241,25 +1326,23 @@ int sceKernelReferVTimerStatus(SceUID uid, SceKernelVTimerInfo *info)
 
     vtimer = UID_CB_TO_DATA(cb, g_threadman.vtimerType, SceThreadmanVTimer);
     buf = &g_threadman.statusBuf.vtimerInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     if (cb->name != NULL)
         strncpy(buf->name, cb->name, SCE_UID_NAME_LEN);
     buf->active = vtimer->active;
     if (vtimer->active) {
         buf->base = vtimer->base;
-        time = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(vtimer->base);
-        THREADMAN_SYSCLOCK_SET(buf->current, time);
+        threadmanSysClockSet(&buf->current, _sceKernelGetSystemTime64() - threadmanSysClockGet(&vtimer->base));
     } else {
-        buf->base.low = 0;
-        buf->base.hi = 0;
+        threadmanSysClockSet32(&buf->base, 0);
         buf->current = vtimer->base;
     }
     buf->schedule = vtimer->schedule;
     buf->handler = vtimer->handler;
     buf->common = vtimer->common;
-    memcpy(info, buf, (buf->size < info->size) ? buf->size : info->size);
+    THREADMAN_COPY_STATUS(info, &g_threadman.statusBuf.vtimerInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -1323,6 +1406,11 @@ int sceKernelSysClock2USec(SceKernelSysClock *clock, unsigned int *low, unsigned
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (c572844): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ */
 /**
  * Convert a system clock value to seconds and microseconds.
  *
@@ -1345,7 +1433,7 @@ int sceKernelSysClock2USecWide(SceInt64 clock, unsigned int *low, unsigned int *
     }
 
     if (low != NULL) {
-        THREADMAN_SYSCLOCK_SET(quot, clock);
+        threadmanSysClockSet(&quot, clock);
         _sceKernelSysClockDivide(&quot, &quot, 1000000, high);
         *low = quot.low;
     } else
@@ -1355,6 +1443,9 @@ int sceKernelSysClock2USecWide(SceInt64 clock, unsigned int *low, unsigned int *
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q042 (e0d596d): Statement/store order taken from the original's store order.
+ */
 /**
  * Get the system time.
  *
@@ -1378,15 +1469,18 @@ int sceKernelGetSystemTime(SceKernelSysClock *time)
     intr = sceKernelCpuSuspendIntr();
 
     now = _sceKernelGetSystemTime64();
-    THREADMAN_SYSCLOCK_SET(*time, now);
+    threadmanSysClockSet(time, now);
 
-    THREADMAN_LOG(SCE_THREADMAN_LOG_GET_SYSTEM_TIME, 2, time->low, time->hi);
+    THREADMAN_LOG(SCE_THREADMAN_LOG_GET_SYSTEM_TIME, 2, time->hi, time->low);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q069 (57a9a84): K1 shifted and restored around the read, as the original.
+ */
 /**
  * Get the system time.
  *
@@ -1395,8 +1489,11 @@ int sceKernelGetSystemTime(SceKernelSysClock *time)
 // Subroutine sceKernelGetSystemTimeWide - Address 0x00010C98
 SceInt64 sceKernelGetSystemTimeWide(void)
 {
+    s32 oldK1;
     s32 intr;
     u64 now;
+
+    oldK1 = pspShiftK1();
 
     intr = sceKernelCpuSuspendIntr();
 
@@ -1405,6 +1502,7 @@ SceInt64 sceKernelGetSystemTimeWide(void)
     THREADMAN_LOG(SCE_THREADMAN_LOG_GET_SYSTEM_TIME_WIDE, 1, (u32)now);
 
     sceKernelCpuResumeIntr(intr);
+    pspSetK1(oldK1);
     return now;
 }
 
@@ -1431,7 +1529,7 @@ void sub_00010D34(SceKernelSysClock *clock, u32 usec)
     u64 time;
 
     time = _sceKernelGetSystemTime64() + usec;
-    THREADMAN_SYSCLOCK_SET(*clock, time);
+    threadmanSysClockSet(clock, time);
 }
 
 /**
@@ -1445,8 +1543,8 @@ void sub_00010D8C(SceKernelSysClock *clock, SceKernelSysClock *delay)
 {
     u64 time;
 
-    time = _sceKernelGetSystemTime64() + THREADMAN_SYSCLOCK_GET(*delay);
-    THREADMAN_SYSCLOCK_SET(*clock, time);
+    time = _sceKernelGetSystemTime64() + threadmanSysClockGet(delay);
+    threadmanSysClockSet(clock, time);
 }
 
 /**
@@ -1479,6 +1577,9 @@ SceUID sceKernelSetAlarm(SceUInt clock, SceKernelAlarmHandler handler, void *com
     return uid;
 }
 
+/*
+ * PARITY-Q054 (fa733b6): Comparison operand order as the original's branch operands.
+ */
 /**
  * Set an alarm.
  *
@@ -1496,12 +1597,12 @@ SceUID sceKernelSetSysClockAlarm(SceKernelSysClock *clock, SceKernelAlarmHandler
     SceUID uid;
 
     oldK1 = pspShiftK1();
-    if (!pspK1StaBufOk(clock, sizeof(*clock)) || handler == NULL || !pspK1PtrOk(handler)) {
+    if (handler == NULL || !pspK1StaBufOk(clock, sizeof(*clock)) || !pspK1PtrOk(handler)) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
     }
 
-    uid = _sceKernelSetAlarm(THREADMAN_SYSCLOCK_GET(*clock), handler, common);
+    uid = _sceKernelSetAlarm(threadmanSysClockGet(clock), handler, common);
 
     THREADMAN_LOG(SCE_THREADMAN_LOG_SET_SYS_CLOCK_ALARM, 5, clock->hi, clock->low, handler, common, uid);
 
@@ -1509,6 +1610,28 @@ SceUID sceKernelSetSysClockAlarm(SceKernelSysClock *clock, SceKernelAlarmHandler
     return uid;
 }
 
+/*
+ * PARITY-Q043 (71496bf): Struct fields filled in struct order (the original's store order).
+ * PARITY-Q044 (71496bf): Register copy cb of the UID control block (the original does not reload the address-taken
+ *     uid from the stack).
+ */
+/*
+ * PARITY-Q097: Both out-of-memory exits share one return through a label, the sceKernelCreateUID success branching
+ *     forward to `created` (MATCHING FORM, not believed to be the original's literal source). Gives the original's layout: one
+ *     shared out-of-line `lui/j/ori` error block, the CreateUID failure as `bnel $v0` to it and the success path
+ *     falling through to `j` back into the main path; with separate returns the error block was duplicated and the
+ *     return value went through $v1. equiv -> sched, wsim +0.075, 1 up / 0 down (remaining: sched1 order of the
+ *     timerType load after the free-list unlink). Same output: the CreateUID test inside a plain else block.
+ *     Shared label with the success test as `!= SCE_ERROR_OK` goto (label in either arm or at the end): +0.040, still
+ *     equiv (CreateUID success branches back instead of falling through).
+ * PARITY-Q127: delay is computed before timer (the two UID_CB_TO_DATA lines swapped): the timerType load of the
+ *     data pointers now follows the clock->low load as in the original. wsim +0.011, csim +0.058, still sched,
+ *     1 up / 0 down. Rejected: schedule copy right after timer (down), field-wise copy (down), uid computed before the
+ *     unlink (down). Residue: the free-list path's timerType load (sched1 places it before the unlink loads).
+ * PARITY-Q159: g_threadman.timerType is an s32 cast to SceSysmemUidCB * at each use (threadman_int.h), so its
+ *     load conflicts with the s32 numFreeDelays store and stays after it, as in the original (fixes the Q127 residue).
+ *     User-approved type-pun exception (19:03 PT 2026-10-27): the s32 alias set is what gives the original load order here.
+ */
 /**
  * Start a delay timer.
  *
@@ -1523,33 +1646,44 @@ SceUID sceKernelSetSysClockAlarm(SceKernelSysClock *clock, SceKernelAlarmHandler
 SceUID sub_00010FAC(SceKernelSysClock *clock, SceThreadmanTimerHandler handler, void *common)
 {
     SceSysmemUidCB *uid;
+    SceSysmemUidCB *cb;
     SceThreadmanListEntry *entry;
     SceThreadmanTimer *timer;
     SceThreadmanDelay *delay;
 
-    if ((s64)(THREADMAN_SYSCLOCK_GET(*clock) - _sceKernelGetSystemTime64()) < 0)
+    if ((s64)(threadmanSysClockGet(clock) - _sceKernelGetSystemTime64()) < 0)
         return SCE_ERROR_KERNEL_WAIT_TIMEOUT;
 
     if (g_threadman.numFreeDelays > 0) {
         entry = g_threadman.freeDelays.next;
         g_threadman.numFreeDelays--;
         threadmanListRemove(entry);
-        uid = THREADMAN_UID_DATA_TO_CB(entry, g_threadman.timerType);
-    } else if (sceKernelCreateUID(g_threadman.delayType, "SceThreadmanDelay", 0, &uid) != SCE_ERROR_OK)
+        uid = THREADMAN_UID_DATA_TO_CB(entry, ((SceSysmemUidCB *)g_threadman.timerType));
+    } else if (sceKernelCreateUID(g_threadman.delayType, "SceThreadmanDelay", 0, &uid) == SCE_ERROR_OK)
+        goto created;
+    else
+        goto nomem;
+created:
+    cb = uid;
+    if (cb == NULL) {
+nomem:
         return SCE_ERROR_KERNEL_NO_MEMORY;
-    if (uid == NULL)
-        return SCE_ERROR_KERNEL_NO_MEMORY;
+    }
 
-    timer = UID_CB_TO_DATA(uid, g_threadman.timerType, SceThreadmanTimer);
-    delay = UID_CB_TO_DATA(uid, g_threadman.delayType, SceThreadmanDelay);
+    delay = UID_CB_TO_DATA(cb, g_threadman.delayType, SceThreadmanDelay);
+    timer = UID_CB_TO_DATA(cb, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     timer->schedule = *clock;
-    delay->common = common;
     delay->handler = handler;
+    delay->common = common;
     _sceKernelInsertTimer(timer);
     _sceKernelUpdateSysTimerCompare();
-    return uid->uid;
+    return cb->uid;
 }
 
+/*
+ * PARITY-Q073: The system time read into a local before the schedule is loaded (the original calls
+ * _sceKernelGetSystemTime64 first).
+ */
 /**
  * Cancel a delay timer.
  *
@@ -1562,6 +1696,7 @@ SceUID sub_00010FAC(SceKernelSysClock *clock, SceThreadmanTimerHandler handler, 
 s32 sub_00011104(SceUID alarmId, SceUInt *remaining)
 {
     s64 diff;
+    u64 now;
     SceKernelSysClock clock;
     SceSysmemUidCB *uid;
     SceThreadmanTimer *timer;
@@ -1569,12 +1704,13 @@ s32 sub_00011104(SceUID alarmId, SceUInt *remaining)
     if (sceKernelGetUIDcontrolBlockWithType(alarmId, g_threadman.delayType, &uid) != SCE_ERROR_OK)
         return -1;
 
-    timer = UID_CB_TO_DATA(uid, g_threadman.timerType, SceThreadmanTimer);
+    timer = UID_CB_TO_DATA(uid, ((SceSysmemUidCB *)g_threadman.timerType), SceThreadmanTimer);
     if (remaining != NULL) {
-        diff = THREADMAN_SYSCLOCK_GET(timer->schedule) - _sceKernelGetSystemTime64();
+        now = _sceKernelGetSystemTime64();
+        diff = threadmanSysClockGet(&timer->schedule) - now;
         if (diff < 0)
             diff = 0;
-        THREADMAN_SYSCLOCK_SET(clock, diff);
+        threadmanSysClockSet(&clock, diff);
         sceKernelSysClock2USec(&clock, NULL, (unsigned int *)remaining);
     }
 
@@ -1592,300 +1728,9 @@ s32 sub_00011104(SceUID alarmId, SceUInt *remaining)
 // Subroutine sub_0001121C - Address 0x0001121C
 s32 _sceKernelTimerInit(void)
 {
-    sceKernelCreateUIDtype("Timer", sizeof(SceThreadmanTimer), g_TimerFuncs, NULL, &g_threadman.timerType);
+    sceKernelCreateUIDtype("Timer", sizeof(SceThreadmanTimer), g_TimerFuncs, NULL, (SceSysmemUidCB **)&g_threadman.timerType);
     sceKernelCreateUIDtypeInherit("Timer", "Delay", 0x30, g_DelayFuncs, NULL, &g_threadman.delayType);
     sceKernelCreateUIDtypeInherit("Timer", "Alarm", 0x30, g_AlarmFuncs, NULL, &g_threadman.alarmType);
     sceKernelCreateUIDtypeInherit("Timer", "VTimer", 0x30, g_VTimerFuncs, NULL, &g_threadman.vtimerType);
     return 0;
-}
-
-/* sub_000112E0 (the syscall handler reading the system time) is implemented in timer_syscall.S. */
-
-/**
- * The suspend handler of the system timer: save its counter.
- *
- * @param unk Unknown.
- * @param param Unused.
- *
- * @return 0.
- */
-// Subroutine sub_000112F8 - Address 0x000112F8
-static s32 _sceKernelSysTimerSuspend(s32 unk, void *param)
-{
-    (void)unk;
-    (void)param;
-
-    g_sysTimerSavedCounter = HW(SYSTIMER_COUNTER);
-    sceKernelDisableIntr(g_threadman.sysTimerIntr);
-
-    /* Make sure the counter is restored before the compare value so that the interrupt is not missed. */
-    if (g_threadman.nextCompare.low - g_sysTimerSavedCounter == 0
-        || g_threadman.nextCompare.low - g_sysTimerSavedCounter > SYSTIMER_OVF_PERIOD)
-        g_sysTimerSavedCounter = g_threadman.nextCompare.low - 1;
-    return 0;
-}
-
-/**
- * The resume handler of the system timer: restore its state.
- *
- * @param unk Unknown.
- * @param param Unused.
- *
- * @return 0.
- */
-// Subroutine sub_0001136C - Address 0x0001136C
-static s32 _sceKernelSysTimerResume(s32 unk, void *param)
-{
-    (void)unk;
-    (void)param;
-
-    HW(SYSTIMER_UNKC) = 1;
-    HW(SYSTIMER_UNK8) = 0x30;
-    HW(SYSTIMER_UNK10) = 0;
-    pspSync();
-    HW(SYSTIMER_COUNTER) = g_sysTimerSavedCounter;
-    pspSync();
-    HW(SYSTIMER_COMPARE) = g_threadman.nextCompare.low;
-    pspSync();
-    pspSync();
-    sceKernelEnableIntr(g_threadman.sysTimerIntr);
-    return 0;
-}
-
-/**
- * Divide a system clock value by a 32-bit value.
- *
- * @param quot Pointer receiving the quotient (may be NULL, may be clock).
- * @param clock The dividend.
- * @param div The divisor.
- * @param rem Pointer receiving the remainder (may be NULL).
- */
-// Subroutine sub_000113F0 - Address 0x000113F0
-static void _sceKernelSysClockDivide(SceKernelSysClock *quot, SceKernelSysClock *clock, u32 div, unsigned int *rem)
-{
-    s32 i;
-    u32 low;
-    u32 cur;
-    u32 r;
-    u32 quotLow;
-    u32 quotHi;
-
-    low = clock->low;
-    quotHi = 0;
-    quotLow = clock->hi / div;
-    r = clock->hi % div;
-    for (i = 3; i >= 0; i--) {
-        cur = (r << 8) | (low >> 24);
-        low <<= 8;
-        quotHi = (quotHi << 8) | (quotLow >> 24);
-        quotLow = (quotLow << 8) + cur / div;
-        r = cur % div;
-    }
-    if (quot != NULL) {
-        quot->low = quotLow;
-        quot->hi = quotHi;
-    }
-    if (rem != NULL)
-        *rem = r;
-}
-
-/**
- * Call the handler of an expired alarm.
- *
- * @param uid The control block of the alarm.
- * @param intr The interrupt state to restore while calling a kernel mode handler.
- *
- * @return The return value of the handler: the delay until its next call, 0 to delete the alarm.
- */
-// Subroutine sub_0001147C - Address 0x0001147C
-static SceUInt _sceKernelCallAlarmHandler(SceSysmemUidCB *uid, s32 intr)
-{
-    u32 oldGp;
-    SceUInt ret;
-    SceThreadmanAlarm *alarm;
-
-    alarm = UID_CB_TO_DATA(uid, g_threadman.alarmType, SceThreadmanAlarm);
-    g_threadman.curTimerUid = uid->uid;
-
-    THREADMAN_LOG(SCE_THREADMAN_LOG_CALL_ALARM_HANDLER, 3, uid->uid, alarm->common, alarm->handler);
-
-    oldGp = pspGetGp();
-    pspSetGp(alarm->gp);
-    if (!alarm->isUser) {
-        sceKernelCpuResumeIntr(intr);
-        ret = alarm->handler(alarm->common);
-        sceKernelCpuSuspendIntr();
-    } else
-        ret = sceKernelCallUserIntrHandler((s32)alarm->common, 0, 0, 0, (s32)alarm->handler,
-            sceKernelGetUserIntrStack());
-    pspSetGp(oldGp);
-
-    g_threadman.curTimerUid = 0;
-    return ret;
-}
-
-/**
- * Call the handler of an expired virtual timer.
- *
- * @param uid The control block of the virtual timer.
- * @param intr The interrupt state to restore while calling a kernel mode handler.
- *
- * @return The return value of the handler: the delay until its next call, 0 to stop calling it.
- */
-// Subroutine sub_00011574 - Address 0x00011574
-static SceUInt _sceKernelCallVTimerHandler(SceSysmemUidCB *uid, s32 intr)
-{
-    u32 oldGp;
-    u64 time;
-    SceUInt ret;
-    SceKernelSysClock actual;
-    SceKernelSysClock *frame;
-    SceThreadmanVTimer *vtimer;
-
-    vtimer = UID_CB_TO_DATA(uid, g_threadman.vtimerType, SceThreadmanVTimer);
-    g_threadman.curTimerUid = uid->uid;
-
-    time = _sceKernelGetSystemTime64() - THREADMAN_SYSCLOCK_GET(vtimer->base);
-    THREADMAN_SYSCLOCK_SET(actual, time);
-
-    THREADMAN_LOG(SCE_THREADMAN_LOG_CALL_VTIMER_HANDLER, 5, uid->uid, vtimer->schedule.low, actual.low,
-        vtimer->common, vtimer->handler);
-
-    oldGp = pspGetGp();
-    pspSetGp(vtimer->gp);
-    if (!vtimer->isUser) {
-        sceKernelCpuResumeIntr(intr);
-        ret = vtimer->handler(uid->uid, &vtimer->schedule, &actual, vtimer->common);
-        sceKernelCpuSuspendIntr();
-    } else {
-        /* Pass the schedule and the actual time on the user interrupt stack. */
-        frame = (SceKernelSysClock *)(sceKernelGetUserIntrStack() - 2 * sizeof(SceKernelSysClock));
-        frame[0] = vtimer->schedule;
-        frame[1] = actual;
-        ret = sceKernelCallUserIntrHandler(uid->uid, (s32)&frame[0], (s32)&frame[1], (s32)vtimer->common,
-            (s32)vtimer->handler, (s32)frame);
-    }
-    pspSetGp(oldGp);
-
-    g_threadman.curTimerUid = 0;
-    return ret;
-}
-
-/**
- * Create an alarm.
- *
- * @param clock The number of microseconds until the alarm expires.
- * @param handler The handler called on expiration.
- * @param common The argument passed to the handler.
- *
- * @return The UID of the new alarm on success, < 0 on error.
- */
-// Subroutine sub_000116F4 - Address 0x000116F4
-static SceUID _sceKernelSetAlarm(u64 clock, SceKernelAlarmHandler handler, void *common)
-{
-    s32 intr;
-    s32 status;
-    u64 schedule;
-    SceSysmemUidCB *uid;
-    SceThreadmanTimer *timer;
-    SceThreadmanAlarm *alarm;
-
-    /* A kernel mode alarm handler must be in kernel memory. */
-    if (!pspK1IsUserMode() && (s32)handler >= 0)
-        return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
-
-    intr = sceKernelCpuSuspendIntr();
-
-    status = sceKernelCreateUID(g_threadman.alarmType, "SceThreadmanAlarm", pspGetK1() >> 31, &uid);
-    if (status != SCE_ERROR_OK) {
-        sceKernelCpuResumeIntr(intr);
-        return status;
-    }
-
-    alarm = UID_CB_TO_DATA(uid, g_threadman.alarmType, SceThreadmanAlarm);
-    timer = UID_CB_TO_DATA(uid, g_threadman.timerType, SceThreadmanTimer);
-    schedule = _sceKernelGetSystemTime64() + clock;
-    THREADMAN_SYSCLOCK_SET(timer->schedule, schedule);
-    alarm->common = common;
-    alarm->isUser = pspK1IsUserMode();
-    alarm->handler = handler;
-    alarm->gp = sceKernelGetModuleGPByAddressForKernel((u32)handler);
-    if (alarm->gp == 0)
-        alarm->gp = pspGetGp();
-    _sceKernelInsertTimer(timer);
-    _sceKernelUpdateSysTimerCompare();
-
-    sceKernelCpuResumeIntr(intr);
-    return uid->uid;
-}
-
-// Subroutine sub_00011834 - Address 0x00011834
-static s32 _sceKernelDelayInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
-{
-    sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
-    return uid->uid;
-}
-
-// Subroutine sub_0001185C - Address 0x0001185C
-static s32 _sceKernelDelayDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
-{
-    sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
-    return SCE_ERROR_OK;
-}
-
-// Subroutine sub_0001187C - Address 0x0001187C
-static s32 _sceKernelAlarmInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
-{
-    sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
-    return uid->uid;
-}
-
-// Subroutine sub_000118A4 - Address 0x000118A4
-static s32 _sceKernelAlarmDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
-{
-    sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
-    return SCE_ERROR_OK;
-}
-
-// Subroutine sub_000118C4 - Address 0x000118C4
-static s32 _sceKernelVTimerInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
-{
-    sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
-    return uid->uid;
-}
-
-// Subroutine sub_000118EC - Address 0x000118EC
-static s32 _sceKernelVTimerDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
-{
-    SceThreadmanVTimer *vtimer;
-    SceThreadmanTimer *timer;
-
-    vtimer = UID_CB_TO_DATA(uid, g_threadman.vtimerType, SceThreadmanVTimer);
-    timer = UID_CB_TO_DATA(uid, g_threadman.timerType, SceThreadmanTimer);
-    if (vtimer->active && vtimer->handler != NULL) {
-        _sceKernelRemoveTimer(timer);
-        _sceKernelUpdateSysTimerCompare();
-    }
-    sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
-    return SCE_ERROR_OK;
-}
-
-// Subroutine sub_000119B8 - Address 0x000119B8
-static s32 _sceKernelTimerInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
-{
-    SceThreadmanTimer *timer;
-
-    sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
-    timer = UID_CB_TO_DATA(uid, uidWithFunc, SceThreadmanTimer);
-    timer->deletePending = 0;
-    timer->link.next = &timer->link;
-    timer->link.prev = &timer->link;
-    return uid->uid;
-}
-
-// Subroutine sub_00011A04 - Address 0x00011A04
-static s32 _sceKernelTimerDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
-{
-    sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
-    return SCE_ERROR_OK;
 }

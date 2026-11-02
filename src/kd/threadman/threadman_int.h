@@ -53,13 +53,90 @@ typedef struct SceThreadmanListEntry {
 /** The COP0 control register holding the thread context whose FPU registers are currently loaded. */
 #define THREADMAN_COP0_CTRL_FPU_OWNER       (8)
 
-/** The address of the profiler registers (0xBC400000), as seen through the uncached kernel segment. */
-#define THREADMAN_PROFILER_REGS             ((PspDebugProfilerRegs *)(0x40000000 | (0xBC400000 & 0x1FFFFFFF)))
+/*
+ * COP0 control register write that can take $zero directly: a constant 0 is written as "ctc0 $zero, $n" (operand
+ * constraint "dJ" + %z), as everywhere in the original module (7 sites) and in other kernel modules (sysmem,
+ * interruptman, exceptionman; survey33/ctc0zero.py). common/cop0.h's pspCop0CtrlSet() only takes a register ("r"),
+ * which makes the compiler materialize 0 in a register (often a callee-saved one) first.
+ */
+/* PARITY-Q009: ctc0 that takes $zero directly ("dJ" + %z), as all 7 original sites; uses grep threadmanCop0CtrlSet */
+static inline void threadmanCop0CtrlSet(int reg, int val)
+{
+    asm("ctc0 %z0, $%1" : : "dJ" (val), "ri" (reg));
+}
+
+/*
+ * COP0 control register read in program order (a volatile asm). common/cop0.h's pspCop0CtrlGet() is non-volatile,
+ * so GCC schedules the cfc0 above earlier stores/branches; in the original the reads stay where the source has them
+ * (e.g. sub_00002944: the context stores, then `cfc0 BadVaddr`).
+ */
+/*
+ * PARITY-Q011: volatile cfc0 for the non-interrupt COP0 reads (EXC_TABLE, FPU owner, profiler base): the original
+ * keeps them in source order
+ */
+static inline s32 threadmanCop0CtrlGet(int reg)
+{
+    s32 ret;
+    asm volatile ("cfc0 %0, $%1" : "=r" (ret) : "ri" (reg));
+    return ret;
+}
+
+/* Read $gp in program order (a volatile asm, like common/registers.h's pspGetSp()). */
+/* PARITY-Q010: volatile $gp read: the original reads $gp in program order; uses grep threadmanGetGp */
+static inline u32 threadmanGetGp(void)
+{
+    u32 gp;
+    asm volatile ("move %0, $gp" : "=r" (gp));
+    return gp;
+}
+
+/**
+ * An address as a segment (top 3 bits) and an offset in it. The profiler getters build the address of the profiler
+ * registers in segment 2 (0x5C400000) with it: 6.60 has `lui rX, 0x4000` before the mode check and
+ * `ins rX, rY(0xBC400000), 0, 29` after it, a bit-field insertion that GCC does not fold across blocks.
+ */
+/*
+ * PARITY-Q006: segment/offset bit-field union: reproduces the original's `lui 0x4000` + `ins ...,0,29` profiler
+ * address build
+ */
+typedef union {
+    u32 addr;
+    struct {
+        u32 offset : 29;
+        u32 segment : 3;
+    } s;
+} SceThreadmanSegAddr;
+
+/** The segment of the profiler registers address returned to the callers. */
+#define THREADMAN_PROFILER_REGS_SEGMENT     (2)
 
 /** The index of the word of g_threadman.readyBitmap holding the bit of a priority. */
 #define THREADMAN_READY_INDEX(prio)         ((u32)(prio) >> 5)
+/*
+ * Disable the interrupts inline (mfie/mtie) and wait 8 cycles for the change to take effect; returns the
+ * previous interrupt enable state. The original's sceKernelReferThreadDebugStatus has these as asm: each
+ * mtie there is followed by exactly 8 nops, which the compiler never emits (sysmem's 46 compiled mtie have
+ * at most 1 nop); the same mtie + nop runs are in hand-written code (interruptman, usersystemlib).
+ */
+/* PARITY-Q013: mfic/mtic followed by exactly 8 nops, as the original (the compiler never emits the nop runs) */
+static inline s32 threadmanSuspendIntrSync(void)
+{
+    s32 intr;
+
+    asm __volatile__ ("mfic %0, $0\n\tmtic $0, $0\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop"
+                      : "=r" (intr));
+    return intr;
+}
+
+/* Restore the interrupt enable state intr and wait 8 cycles (see threadmanSuspendIntrSync()). */
+static inline void threadmanResumeIntrSync(s32 intr)
+{
+    asm __volatile__ ("mtic %0, $0\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop\n\tnop" : : "r" (intr));
+}
+
 /** The bit of a priority in g_threadman.readyBitmap[THREADMAN_READY_INDEX(priority)] (a rotation of 0x80000000). */
-#define THREADMAN_READY_BIT(prio)           ((0x80000000 >> ((prio) & 0x1F)) | (0x80000000 << (-(prio) & 0x1F)))
+/* PARITY-Q034: ready bit as a rotation with % 32, the form GCC turns into the original's rotr */
+#define THREADMAN_READY_BIT(prio)           ((0x80000000 >> ((prio) % 32)) | (0x80000000 << (32 - (prio) % 32)))
 
 /** A thread is deleted when less than this many bytes are left on its stack. */
 #define SCE_THREADMAN_MIN_FREE_STACK        (0x40)
@@ -99,12 +176,47 @@ typedef struct SceThreadmanListEntry {
 /** The mode of a thread: the top 4 bits of its attributes, with SCE_THREADMAN_THREAD_ATTR_USER inverted. */
 #define THREADMAN_THREAD_MODE(thread) (((thread)->attr ^ SCE_THREADMAN_THREAD_ATTR_USER) >> 28)
 
+/**
+ * Initialize the circular list head as empty.
+ *
+ * PARITY-Q201 (source form): next is stored before prev (see _sceKernelSysTimerInit).
+ */
+static inline void threadmanListInit(SceThreadmanListEntry *head)
+{
+    head->next = head;
+    head->prev = head;
+}
+
 /** Insert entry at the end of the circular list head. */
 static inline void threadmanListAddTail(SceThreadmanListEntry *head, SceThreadmanListEntry *entry)
 {
     entry->next = head;
     entry->prev = head->prev;
     head->prev = entry;
+    entry->prev->next = entry;
+}
+
+/*
+ * PARITY-Q165: A list head seen as its own record type, used only for the suspended-thread add in
+ * sub_00014124 (user-approved). Its accesses are in a different alias set from SceThreadmanListEntry's,
+ * which reproduces the original's store order there (head->prev and entry->next scheduled as in the original
+ * build). Applied to the suspendedThreads field itself, it regresses the four other adds of that list
+ * (they keep the entry type), so the type is used through a cast in that one function only.
+ */
+/** A circular list head (its own type: not a list entry, but linked to like one). */
+typedef struct {
+    /** The first entry (the head itself if the list is empty). */
+    SceThreadmanListEntry *next; // 0
+    /** The last entry (the head itself if the list is empty). */
+    SceThreadmanListEntry *prev; // 4
+} SceThreadmanListHead; // size: 8
+
+/** Insert entry at the end of the circular list headed by head. */
+static inline void threadmanListHeadAddTail(SceThreadmanListHead *head, SceThreadmanListEntry *entry)
+{
+    entry->prev = head->prev;
+    head->prev = entry;
+    entry->next = (SceThreadmanListEntry *)head;
     entry->prev->next = entry;
 }
 
@@ -136,7 +248,11 @@ typedef struct {
     u32 status; // 52
     /** The address the execution resumes at. */
     u32 epc; // 56
-    u32 unk60; // 60
+    /**
+     * The COP0 control register 23 (saved by SaveThreadContext() with "cfc0 $t4, $23; sw $t4, 60($a0)" and
+     * restored by InterruptManagerForKernel_551097F2() with "lw $k0, 60($a0); ctc0 $k0, $23", see interruptman start.S).
+     */
+    u32 cop0Ctrl23; // 60
     /** The general purpose registers. */
     u32 gpr[32]; // 64
     /** The FPU registers. */
@@ -161,14 +277,28 @@ typedef void (*SceThreadmanDeadThreadHandler)(SceUID thid, SceThreadmanContext *
 typedef struct {
     u32 unk0[16]; // 0
     /** The TLS pool blocks of the thread, indexed by the slot of their pool. */
-    void *tls[16]; // 64
+    /*
+     * PARITY-Q026: u32 words (alias set of SceSize): the blockSize load stays after the tls store as in the
+     * original
+     */
+    u32 tls[16]; // 64
     u32 unk128[16]; // 128
     /** The UID of the thread. */
     SceUID threadId; // 192
     /** Set while the thread dispatch is suspended (sceKernelSuspendDispatchThread()), for user threads. */
-    u32 dispatchSuspended; // 196
+    /*
+     * PARITY-Q124: wrapped in a union (as Q070): the union access gives alias set 0, so the store conflicts with
+     * the thread->context load and sub_00013E80 reloads the context as the original does
+     */
+    union {
+        u32 dispatchSuspended;
+    }; // 196
+    /*
+     * PARITY-Q141: k0 stackLow typed u8 * (not void *): the store in sceKernelStartThread then has its own alias
+     *   set instead of sharing the void * one with the thread's stack fields.
+     */
     /** The lowest address of the stack of the thread. */
-    void *stackLow; // 200
+    u8 *stackLow; // 200
     u32 unk204[11]; // 204
     s32 unk248; // 248
     s32 unk252; // 252
@@ -269,13 +399,18 @@ typedef struct SceThreadmanThread {
     s32 currentPriority; // 16
     /** The thread attributes (SCE_THREADMAN_THREAD_ATTR_*). */
     u32 attr; // 20
-    u32 unk24; // 24
+    /**
+     * Set when the thread uses the FPU: set to 1 by the COP1 unusable exception handler sub_00000338() when
+     * it enables COP1 for the thread ("sw $v1, 0x18($v0)"), saved around the callbacks.
+     */
+    u32 fpuUsed; // 24
     /** The saved thread context. */
     SceThreadmanContext *context; // 28
     /** The VFPU context of the thread (allocated from the threadman heap, NULL if the thread does not use the VFPU). */
-    SceThreadmanVfpuContext *vfpuContext; // 32
+    /* PARITY-Q027: void * (vfpuContext, syscallFrame): the alias-set reloads of the original in sub_000180AC */
+    void *vfpuContext; // 32
     /** The register frame of the current syscall (NULL when none). */
-    SceThreadmanSyscallFrame *syscallFrame; // 36
+    void *syscallFrame; // 36
     /** The user mode stack pointer (written to COP0_CTRL_SP_USER). */
     u32 userSp; // 40
     void *stackLow; // 44
@@ -304,7 +439,13 @@ typedef struct SceThreadmanThread {
      * Wait type specific data (for semaphores: the requested count; for event flags: the bit pattern,
      * the wait mode and the address receiving the matched pattern).
      */
-    s32 waitData[6]; // 96
+    /*
+     * PARITY-Q070: wrapped in a union (the original reuses one field per wait type); the union access gives alias set 0,
+     * which the original's scheduling of the wait-data stores/loads needs
+     */
+    union {
+        s32 waitData[6];
+    }; // 96
     /** The alarm ending the current wait on timeout (0 when the wait has no timeout). */
     SceUID timeoutAlarmId; // 120
     /** The timeout of the current wait (receives the remaining time when the wait ends), if any. */
@@ -340,12 +481,20 @@ typedef struct SceThreadmanThread {
     s16 basePriority; // 186
     /** The highest ceiling priority of the mutexes the thread owns (0x7F when none). */
     s32 mutexPriority; // 188
+    /*
+     * PARITY-Q142: entry typed void * (threadman never calls it, only loads it into EPC): the load then shares
+     *   the void * alias set, so sceKernelReferThreadStatus reads it at the original's position.
+     */
     /** The entry point of the thread. */
-    SceKernelThreadEntry entry; // 192
+    void *entry; // 192
     /** The size of the (user or kernel) stack of the thread. */
     s32 stackSize; // 196
-    /** The stack a user mode callback runs on when the thread is not in a syscall. */
-    u32 unk200; // 200
+    /**
+     * The initial stack pointer of the thread (the top of its stack, below the $k0 area of a user mode thread),
+     * set by sceKernelStartThread() and used as the initial $sp and $fp, and as the stack a user mode callback
+     * runs on when the thread is not in a syscall.
+     */
+    u32 initSp; // 200
     /** The size of the kernel stack of a user mode thread. */
     s32 kStackSize; // 204
     /**
@@ -389,8 +538,11 @@ typedef struct SceThreadmanThread {
 typedef struct {
     /** The attributes of the object (SCE_THREADMAN_WAITQ_ATTR_*). */
     u32 attr; // 0
-    /** When set, the first waiting thread is being served: priority ordered insertions keep it first. */
-    u32 unk4; // 4
+    /**
+     * When set, the first waiting thread is being served (a message pipe transfer of it is partially done,
+     * see msgpipe.c: set to "origSize != size"): priority ordered insertions keep it first.
+     */
+    u32 firstServing; // 4
     /** The number of threads waiting on the object. */
     s32 numWaitThreads; // 8
     /** The list of waiting threads. */
@@ -570,8 +722,43 @@ typedef struct {
 #define THREADMAN_SYSCLOCK_SET(clock, value) \
     do { \
         (clock).low = (u32)(value); \
-        (clock).hi = (u32)((value) >> 32); \
+        (clock).hi = (u32)((u64)(value) >> 32); \
     } while (0)
+
+/*
+ * Pointer-based accessors for a system clock. Most code uses these; _sceKernelInsertTimer and
+ * _sceKernelUpdateSysTimerCompare read and write the fields directly (the macros above).
+ */
+
+/** Get the 64-bit value of the system clock clock. */
+static inline u64 threadmanSysClockGet(SceKernelSysClock *clock)
+{
+    return ((u64)clock->hi << 32) | clock->low;
+}
+
+/** Set the system clock clock to the 64-bit value value. */
+/*
+ * PARITY-Q007: clock setter stores hi then low through a volatile pointer (the original's store order); pointer-
+ * taking accessors
+ */
+static inline void threadmanSysClockSet(volatile SceKernelSysClock *clock, u64 value)
+{
+    clock->hi = (u32)(value >> 32);
+    clock->low = (u32)value;
+}
+
+/*
+ * PARITY-Q161: A separate 32-bit setter (hi stored as 0, low from a u32) for the 32-bit constant sets. Through the
+ *     u64 threadmanSysClockSet() the 64-bit constant SYSTIMER_OVF_PERIOD leaves a dead `li $v1, 0` (its high word)
+ *     in _sceKernelSysTimerInit, which the original does not have. Used for every constant set (SysTimerInit x2,
+ *     the two zero clears in timer.c); the zero clears are unchanged.
+ */
+/** Set a SceKernelSysClock to a 32-bit value. */
+static inline void threadmanSysClockSet32(volatile SceKernelSysClock *clock, u32 value)
+{
+    clock->hi = 0;
+    clock->low = value;
+}
 
 /** The data of a "Timer" UID object, the base type of the delay timers, the alarms and the virtual timers. */
 typedef struct {
@@ -711,8 +898,111 @@ typedef struct {
 #define SCE_THREADMAN_UID_ATTR_CANCEL   (0x08)
 #define SCE_THREADMAN_UID_ATTR_DELETE   (0x10)
 
-/** Check whether the caller has the permission perm (SCE_THREADMAN_UID_ATTR_*) on the UID object uid. */
-#define THREADMAN_UID_PERM_OK(uid, perm) (!pspK1IsUserMode() || ((uid)->attr & (perm)))
+/*
+ * The wait functions and their callback variants (sceKernelWaitSema() and sceKernelWaitSemaCB(), ...) are
+ * tail jumps to a common function, passing withCallbacks in $t3, the 8th argument register, whatever the
+ * number of arguments: "j impl; addiu $t3, $zero, withCallbacks". GCC cannot emit this (no naked functions
+ * on MIPS, and it would set the unused argument registers), so the thunk is written as top-level assembly.
+ * The common function takes only its real arguments and reads $t3 with threadmanGetWithCallbacks().
+ */
+/*
+ * PARITY-Q003: the Wait and WaitCB entry points are `j impl; addiu $t3,$zero,N` thunks in the original (top-level
+ * asm); all uses grep THREADMAN_WITH_CALLBACKS_THUNK
+ */
+/*
+ * PARITY-Q186: each thunk is put in its own `.text.<name>` section (pushsection/popsection) instead of `.text`. The
+ * matching build compiles with -ffunction-sections (one gas fixup chain per function, which is what reproduces the
+ * HI16/LO16 order of the original relocation stream); a thunk left in `.text` would be linked before all the function
+ * sections of its object, moving it away from its place between the C functions.
+ */
+#define THREADMAN_WITH_CALLBACKS_THUNK(name, impl, withCallbacks) \
+    asm(".pushsection .text." #name ", \"ax\", @progbits\n" \
+        ".align 2\n" \
+        ".globl " #name "\n" \
+        ".type " #name ", @function\n" \
+        ".ent " #name "\n" \
+        #name ":\n" \
+        ".set push\n" \
+        ".set noreorder\n" \
+        "j " #impl "\n" \
+        "addiu $t3, $zero, " #withCallbacks "\n" \
+        ".set pop\n" \
+        ".end " #name "\n" \
+        ".size " #name ", . - " #name "\n" \
+        ".popsection\n")
+
+/*
+ * Switch $gp to gp and return the previous value. The handler calls in 6.60 keep `move rX,$gp; move $gp,rY` together,
+ * after the load of the new value and before everything that follows (no interblock motion), which is what volatile
+ * asm gives (registers.h pspSetGp() is non-volatile, so GCC hoists the $gp read into an earlier block).
+ */
+/* PARITY-Q005: volatile $gp save+switch kept together after the new value's load, as in the original handler calls */
+static inline u32 threadmanSwapGp(u32 gp)
+{
+    u32 oldGp;
+
+    asm volatile("move %0, $gp" : "=r" (oldGp));
+    asm volatile("move $gp, %0" : : "r" (gp));
+    return oldGp;
+}
+
+/*
+ * Read withCallbacks from $t3 (set by THREADMAN_WITH_CALLBACKS_THUNK()), as the first statement of the common
+ * function. This is hand-written assembly in the original too: in all 12 common functions of 6.60 the `move rX, $t3`
+ * is a full scheduling barrier (every callee save, argument copy and argument spill is before it, every body
+ * instruction after it, including the k1/cfc0 entry checks that GCC otherwise moves into the prologue). Only a
+ * volatile asm gives that: a C parameter in $t3 is an ordinary argument copy that the scheduler moves freely.
+ * See threadman-deviations.md section 4 (assembly usage).
+ */
+/*
+ * PARITY-Q004: volatile read of $t3: in all 12 common wait functions the original's `move rX,$t3` is a full
+ * scheduling barrier
+ */
+static inline s32 threadmanGetWithCallbacks(void)
+{
+    s32 withCallbacks;
+
+    asm volatile("move %0, $t3" : "=r" (withCallbacks));
+    return withCallbacks;
+}
+
+/** The break code of the unrecoverable errors (returning from a callback or a stack extension in a wrong context). */
+#define THREADMAN_BREAKCODE_FATAL           (0xFFF)
+
+/**
+ * Check whether the caller has the permission perm (SCE_THREADMAN_UID_ATTR_*) on the UID object uid: a kernel
+ * mode caller always has it.
+ */
+/** Check whether the caller may do the operations perm (SCE_THREADMAN_UID_ATTR_*) on uid (always in kernel mode). */
+/* PARITY-Q033: permission check as an inline function (the original's branch shape) */
+static inline u32 threadmanUidPermOk(SceSysmemUidCB *uid, u32 perm)
+{
+    u32 ok = uid->attr & perm;
+
+    if (((u32)pspGetK1() >> 31) == 0)
+        ok = perm;
+    return ok;
+}
+
+#define THREADMAN_UID_PERM_OK(uid, perm) threadmanUidPermOk((SceSysmemUidCB *)(uid), (perm))
+
+/* THREADMAN_UID_PERM_OK with the caller mode (pspK1IsUserMode()) already read. PARITY-Q076 */
+static inline u32 threadmanUidPermOkMode(SceSysmemUidCB *uid, u32 perm, u32 userMode)
+{
+    u32 ok = uid->attr & perm;
+
+    if (userMode == 0)
+        ok = perm;
+    return ok;
+}
+
+/* Copy a status structure to the caller's buffer, truncated to the smaller of both sizes. */
+/*
+ * PARITY-Q018: src passed as an address expression so the size is read through a constant address, as the
+ * original; uses grep THREADMAN_COPY_STATUS
+ */
+#define THREADMAN_COPY_STATUS(dst, src) \
+    memcpy((dst), (src), ((src)->size < (dst)->size) ? (src)->size : (dst)->size)
 
 /* UID object functions implemented by the WaitQ-derived types */
 #define SCE_THREADMAN_UID_FUNC_WAITQ_CANCEL         (0x86D94883)
@@ -950,9 +1240,11 @@ typedef struct {
     /** The system time of the last thread switch. */
     SceKernelSysClock lastSwitchClock; // 112
     /** The 64-bit system time at the last system timer overflow (its upper 32 bits). */
-    SceKernelSysClock sysTimeBase; // 120
+    /* PARITY-Q024: volatile: _sceKernelGetSystemTime64 loads it in source order as the original */
+    volatile SceKernelSysClock sysTimeBase; // 120 (volatile: updated by the system timer interrupt; read without interrupts disabled in _sceKernelGetSystemTime64)
     /** The value programmed in the compare register of the system timer. */
-    SceKernelSysClock nextCompare; // 128
+    /* PARITY-Q025: volatile: the original's lw/sw/lw/sw copy in _sceKernelSysTimerIntr */
+    volatile SceKernelSysClock nextCompare; // 128
     /** Bitmap of the non-empty ready queues. */
     u32 readyBitmap[4]; // 136
     /** The ready queues, one per priority. */
@@ -995,8 +1287,13 @@ typedef struct {
     SceSysmemUidCB *threadEventHandlerType; // 1268
     /** The "Callback" UID type. */
     SceSysmemUidCB *callbackType; // 1272
+    /*
+     * PARITY-Q159: Integer field (cast to SceSysmemUidCB * at each use) instead of a pointer: its loads share the s32
+     *     alias set, so the scheduler keeps them after int stores to g_threadman (sub_00010FAC: after the
+     *     numFreeDelays decrement), as in the original.
+     */
     /** The "Timer" UID type (the base type of the delay timers, the alarms and the virtual timers). */
-    SceSysmemUidCB *timerType; // 1276
+    s32 timerType; // 1276
     /** The "Delay" UID type (internal timers, used by timeouts and thread delays). */
     SceSysmemUidCB *delayType; // 1280
     /** The "Alarm" UID type. */
@@ -1076,29 +1373,54 @@ typedef struct {
     u64 (*getSystemTime)(void); // 2048
 } SceThreadman; // size: 2052
 
+/* PARITY-Q016: see threadman.c: the aligned declaration is for threadman.c only */
+#ifdef THREADMAN_C
+/* threadman.c defines it on a data cache line (64 bytes); declared here with the same alignment for its inlines. */
+extern SceThreadman g_threadman __attribute__((aligned(64)));
+#else
 extern SceThreadman g_threadman;
+#endif
 
 /* Interrupt context check (the threadman reads the COP0 control register directly). */
 #define THREADMAN_IS_INTR_CONTEXT() (pspCop0CtrlGet(COP0_CTRL_IS_INTERRUPT) != 0)
 
+/*
+ * PARITY-Q143: a static inline rather than a macro (sceKernelCreateMutex, its only user). The inline copies
+ * priority into its own pseudo, which changes the allocation ranking: $fp then holds name (a0) and the s-registers
+ * follow the original order (equiv -> sched, 156 -> 155 instructions). Residue: two load/shift pairs swapped. Plain C.
+ */
 /** Check whether prio is a valid thread priority for the caller (8 - 119 in user mode, 1 - 126 in kernel mode). */
-#define THREADMAN_IS_VALID_PRIORITY(prio) \
-    (pspK1IsUserMode() ? ((u32)((prio) - 8) < 0x70) : ((u32)((prio) - 1) < 0x7E))
+static inline s32 THREADMAN_IS_VALID_PRIORITY(s32 prio)
+{
+    return pspK1IsUserMode() ? ((u32)(prio - 8) < 0x70) : ((u32)(prio - 1) < 0x7E);
+}
 
-/** Call the debug log handler, if set. */
+/**
+ * Call the debug log handler, if set. The original lays out every one of these calls out of line (the call is
+ * branched to and jumps back). GCC 3.3 predicts this from the plain check already (its RTL heuristics), so no
+ * __builtin_expect: with it, the layout is the same but the call blocks get a lower frequency, which changes
+ * the register allocation of the values passed to the handler.
+ */
+/*
+ * PARITY-Q029: log hook passes __builtin_frame_address(0) (the original's `move $a1,$fp`); handler check expected
+ * to fail, calls out of line
+ */
 #define THREADMAN_LOG(eventId, numArgs, ...) \
     if (g_threadman.logHandler != NULL) \
-        g_threadman.logHandler(eventId, (void *)pspGetFp(), numArgs, ##__VA_ARGS__)
+        g_threadman.logHandler(eventId, __builtin_frame_address(0), numArgs, ##__VA_ARGS__)
 
 
+/*
+ * PARITY-Q042 (dae0923): Statement/store order taken from the original's store order.
+ */
 /** Add a thread at the end of the ready queue of its priority (see sub_000127D0()). */
 static inline void threadmanReadyQueueAdd(SceThreadmanThread *thread)
 {
     s32 prio;
 
     prio = thread->currentPriority;
-    threadmanListAddTail(&g_threadman.readyQueue[prio], &thread->link);
     g_threadman.readyBitmap[THREADMAN_READY_INDEX(prio)] |= THREADMAN_READY_BIT(prio);
+    threadmanListAddTail(&g_threadman.readyQueue[prio], &thread->link);
 }
 
 /**
@@ -1121,16 +1443,16 @@ static inline s32 threadmanReadyQueueGetHighestPriority(void)
     s32 clz;
 
     /* Find the first bit set of the ready bitmap. */
-    prio = __builtin_clzg(g_threadman.readyBitmap[3], 32) + 32;
-    clz = __builtin_clzg(g_threadman.readyBitmap[2], 32);
+    prio = pspClz(g_threadman.readyBitmap[3]) + 32;
+    clz = pspClz(g_threadman.readyBitmap[2]);
     if (g_threadman.readyBitmap[2] == 0)
         clz = prio;
     prio = clz + 32;
-    clz = __builtin_clzg(g_threadman.readyBitmap[1], 32);
+    clz = pspClz(g_threadman.readyBitmap[1]);
     if (g_threadman.readyBitmap[1] == 0)
         clz = prio;
     prio = clz + 32;
-    clz = __builtin_clzg(g_threadman.readyBitmap[0], 32);
+    clz = pspClz(g_threadman.readyBitmap[0]);
     if (g_threadman.readyBitmap[0] == 0)
         clz = prio;
     return clz;
@@ -1146,13 +1468,22 @@ static inline void threadmanReadyQueueRemove(SceThreadmanThread *thread, s32 pri
     threadmanListRemove(&thread->link);
 }
 
+/*
+ * PARITY-Q089: threadmanProfilerPause()/threadmanProfilerResume() jump to the profiler code with a goto after the
+ * no-profiler return: the original places both profiler blocks of sub_00000FE4 out of line, after the return.
+ */
 /** Pause the hardware profiler, if one is in use (it must not count the thread switch). */
 static inline void threadmanProfilerPause(void)
 {
     SceThreadmanProfiler *profiler;
 
-    profiler = (SceThreadmanProfiler *)pspCop0CtrlGet(COP0_CTRL_PROFILER_BASE);
-    if (profiler != NULL && ++profiler->pauseCount == 1) {
+    profiler = (SceThreadmanProfiler *)threadmanCop0CtrlGet(COP0_CTRL_PROFILER_BASE);
+    if (profiler != NULL)
+        goto pause;
+    return;
+
+pause:
+    if (++profiler->pauseCount == 1) {
         profiler->savedEnable = *profiler->enable;
         *profiler->enable = 0;
         pspSync();
@@ -1164,12 +1495,33 @@ static inline void threadmanProfilerResume(void)
 {
     SceThreadmanProfiler *profiler;
 
-    profiler = (SceThreadmanProfiler *)pspCop0CtrlGet(COP0_CTRL_PROFILER_BASE);
-    if (profiler != NULL && profiler->pauseCount != 0 && --profiler->pauseCount == 0) {
+    profiler = (SceThreadmanProfiler *)threadmanCop0CtrlGet(COP0_CTRL_PROFILER_BASE);
+    if (profiler != NULL)
+        goto resume;
+    return;
+
+resume:
+    if (profiler->pauseCount != 0 && --profiler->pauseCount == 0) {
         *profiler->enable = profiler->savedEnable;
         pspSync();
     }
 }
+
+/*
+ * Check a buffer of dynamic size against $k1. Same test as pspK1DynBufOk() (common/registers.h), with $k1
+ * as the first operand of the AND as in the original: all of threadman's dynamic-size buffer checks
+ * (sceKernelStartThread, sceKernelGetThreadmanIdList, ThreadManForUser_28BFD974, the MsgPipe senders and
+ * receivers) do `and rd, k1, mask`, while the static-size checks do `and rd, mask, k1`.
+ */
+/* PARITY-Q017: k1 & mask operand order of all 7 dynamic-size buffer checks of the original */
+static inline int threadmanK1DynBufOk(const void *ptr, int size)
+{
+    return ((pspGetK1() & (((int)ptr + size) | (int)ptr | size)) >= 0);
+}
+
+/** Check whether the calling application was compiled with an SDK newer than version. */
+/* PARITY-Q035: a macro with a signed compare: the original's slt, constant not held across the call */
+#define threadmanSdkVersionAbove(version) ((s32)sceKernelGetCompiledSdkVersion() > (s32)(version))
 
 /*
  * InterruptManagerForKernel thread context functions (not declared in interruptman.h, whose
@@ -1261,6 +1613,51 @@ s32 _sceKernelReleaseThreadTls(SceThreadmanThread *thread);
 SceUID _sceKernelGetTlsplByBlockId(SceUID blockId);
 s32 _sceKernelTlsplInit(void);
 
+/* timers (timer.c and timer_handler.c) */
+/** The counter of the system timer (the lower 32 bits of the system time). */
+#define SYSTIMER_COUNTER    (0xBC600000)
+/** The compare register of the system timer (an interrupt is raised when the counter reaches it). */
+#define SYSTIMER_COMPARE    (0xBC600004)
+#define SYSTIMER_UNK8       (0xBC600008)
+#define SYSTIMER_UNKC       (0xBC60000C)
+#define SYSTIMER_UNK10      (0xBC600010)
+
+/** The period of the system timer overflow timer, in microseconds. */
+#define SYSTIMER_OVF_PERIOD (0xF0000000)
+
+/** The syscall / suspend / resume handler slot of the system timer. */
+#define SYSTIMER_HANDLER_ID (0x18)
+
+/*
+ * PARITY-Q054 (4f442e8): Comparison operand order as the original's branch operands.
+ */
+/** Remove the active timer timer from the timer list (keeping the interrupt handler's iterator valid). */
+static inline void _sceKernelRemoveTimer(SceThreadmanTimer *timer)
+{
+    if (&timer->link == g_threadman.nextTimer)
+        g_threadman.nextTimer = timer->link.next;
+    threadmanListRemove(&timer->link);
+    timer->link.next = &timer->link;
+    timer->link.prev = &timer->link;
+}
+
+void _sceKernelInsertTimer(SceThreadmanTimer *timer);
+void _sceKernelUpdateSysTimerCompare(void);
+s32 _sceKernelSysTimerSuspend(s32 unk, void *param);
+s32 _sceKernelSysTimerResume(s32 unk, void *param);
+void _sceKernelSysClockDivide(SceKernelSysClock *quot, SceKernelSysClock *clock, u32 div, unsigned int *rem);
+SceUInt _sceKernelCallAlarmHandler(SceSysmemUidCB *uid, s32 intr);
+SceUInt _sceKernelCallVTimerHandler(SceSysmemUidCB *uid, s32 intr);
+SceUID _sceKernelSetAlarm(u64 clock, SceKernelAlarmHandler handler, void *common);
+s32 _sceKernelDelayInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
+s32 _sceKernelDelayDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
+s32 _sceKernelAlarmInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
+s32 _sceKernelAlarmDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
+s32 _sceKernelVTimerInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
+s32 _sceKernelVTimerDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
+s32 _sceKernelTimerInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
+s32 _sceKernelTimerDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
+
 /* alarm / system time */
 void _sceKernelSysTimerInit(void);
 s32 _sceKernelTimerInit(void);
@@ -1284,9 +1681,45 @@ s32 sub_00016FA4(void);
 s32 ThreadManForKernel_D366D35A(s32 disable);
 void sub_0001752C(SceSysmemUidCB *uid);
 void sub_000177C4(SceThreadmanThread *thread, s32 kernelStack, u32 sp);
-void sub_000180AC(SceSysmemUidCB *cb, SceKernelThreadKInfo *info);
+void sub_000180AC(SceSysmemUidCB *cb, SceKernelThreadKInfo *info, s32 isIntr);
 s32 sub_00017EB4(SceUID blockId, void *stackLow, SceSize stackSize, s32 (*func)(void *), void *argp);
 void sub_00017844(SceThreadmanThread *thread);
+
+/*
+ * PARITY-Q065 (35fb533): Guard and arm shape taken from the original's layout (wait arm first, positive guards, addr
+ *     != NULL block).
+ */
+/**
+ * Make a thread ready, switching to it if it has a higher priority than the current thread (the body
+ * of sub_00016C48(), which sceKernelStartThread() has inlined).
+ */
+/* PARITY-Q032: inline ready/preempt logic: sceKernelStartThread has sub_00016C48's body inlined in the original */
+static inline void threadmanReadyThread(SceThreadmanThread *thread, s32 intr)
+{
+    s32 prio;
+    SceThreadmanThread *curThread;
+
+    curThread = g_threadman.curThread;
+    if (thread->currentPriority < curThread->currentPriority && g_threadman.dispatchSuspended == 0) {
+        prio = curThread->currentPriority;
+        if (intr == 0) {
+            thread->status = SCE_THREADMAN_STATUS_READY;
+            sub_000127D0(thread);
+            g_threadman.nextThread = NULL;
+        } else {
+            /* Preempt the current thread: put it back at the head of its ready queue. */
+            threadmanListAddTail(g_threadman.readyQueue[prio].next, &curThread->link);
+            g_threadman.readyBitmap[THREADMAN_READY_INDEX(prio)] |= THREADMAN_READY_BIT(prio);
+            g_threadman.nextThread = thread;
+            curThread->status = SCE_THREADMAN_STATUS_READY;
+            thread->status = SCE_THREADMAN_STATUS_RUNNING;
+        }
+        sub_00000FE4(0, intr);
+        return;
+    }
+    thread->status = SCE_THREADMAN_STATUS_READY;
+    sub_000127D0(thread);
+}
 void sub_000183EC(SceKernelSystemStatus *status, s32 intr);
 s32 sub_00016B40(void);
 void sub_00000338(void);

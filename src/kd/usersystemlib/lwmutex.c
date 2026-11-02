@@ -170,7 +170,7 @@ s32 sceKernelUnlockLwMutex(SceLwMutex *mutex, s32 count)
 
     mutex->lockCount = 0;
 
-    if (pspLl(&mutex->unk3) != 0) {
+    if (pspLl(&mutex->numWaitThreads) != 0) {
         mutex->lockCount = prevCount;
         // ThreadManForUser_BEED3A47
         return _sceKernelUnlockLwMutex(mutex, count);

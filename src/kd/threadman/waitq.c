@@ -48,7 +48,7 @@ static inline void _sceKernelWaitQInsertByPriority(SceThreadmanWaitQ *waitQ, Sce
             break;
     }
     /* The first waiting thread is being served: never insert in front of it. */
-    if (waitQ->unk4 != 0 && pos->prev == &waitQ->waitList)
+    if (waitQ->firstServing != 0 && pos->prev == &waitQ->waitList)
         pos = pos->next;
     threadmanListAddTail(pos, &thread->link);
 }
@@ -91,6 +91,11 @@ static inline s32 _sceKernelReleaseWait(SceThreadmanThread *thread)
 }
 
 /* End the waits of all the threads waiting on uid with the wait status waitStatus. Return their number. */
+/*
+ * PARITY-Q042 (7dd2985): Statement/store order taken from the original's store order.
+ * PARITY-Q050 (7dd2985): Loop shape (guarded block instead of continue / separate next cursor / head pointer walk) as
+ *     the original's layout.
+ */
 static inline s32 _sceKernelReleaseAllWaits(SceSysmemUidCB *uid, s32 waitStatus)
 {
     s32 numReleased;
@@ -103,14 +108,17 @@ static inline s32 _sceKernelReleaseAllWaits(SceSysmemUidCB *uid, s32 waitStatus)
     entry = waitQ->waitList.next;
     while (entry != &waitQ->waitList) {
         thread = (SceThreadmanThread *)entry;
+        entry = entry->next;
         thread->waitStatus = waitStatus;
         numReleased++;
-        entry = entry->next;
         sub_00000924(thread);
     }
     return numReleased;
 }
 
+/*
+ * PARITY-Q042 (3b11026): Statement/store order taken from the original's store order.
+ */
 // Subroutine sub_00000680 - Address 0x00000680
 /*
  * Make the current thread wait on uid (the wait type specific data must already be set) and switch to
@@ -140,8 +148,8 @@ s32 sub_00000680(SceSysmemUidCB *uid, s32 waitType, u32 waitAttr, SceKernelSysCl
         thread->waitWithCallbacks = 0;
         if (alarmId != 0) {
             sub_00011104(alarmId, NULL);
-            thread->timeout = NULL;
             thread->timeoutAlarmId = 0;
+            thread->timeout = NULL;
         }
         return SCE_ERROR_KERNEL_WAIT_STATUS_RELEASED_CALLBACK;
     }
@@ -164,6 +172,9 @@ s32 sub_00000680(SceSysmemUidCB *uid, s32 waitType, u32 waitAttr, SceKernelSysCl
     return thread->waitStatus;
 }
 
+/*
+ * PARITY-Q042 (1db041d): Statement/store order taken from the original's store order.
+ */
 // Subroutine sub_00000858 - Address 0x00000858
 /* Make the current thread wait in the list waitList, without wait object. */
 void sub_00000858(SceThreadmanListEntry *waitList, s32 waitType)
@@ -172,10 +183,10 @@ void sub_00000858(SceThreadmanListEntry *waitList, s32 waitType)
 
     thread = g_threadman.curThread;
     threadmanListAddTail(waitList, &thread->link);
-    thread->status = SCE_THREADMAN_STATUS_WAIT;
     thread->waitType = waitType;
     thread->waitObj = NULL;
     thread->waitStatus = SCE_ERROR_OK;
+    thread->status = SCE_THREADMAN_STATUS_WAIT;
 }
 
 // Subroutine sub_00000890 - Address 0x00000890
@@ -200,6 +211,9 @@ s32 sub_00000924(SceThreadmanThread *thread)
     return _sceKernelReleaseWait(thread);
 }
 
+/*
+ * PARITY-Q065: Guard and arm shape taken from the original's layout (the !dispatch arm first).
+ */
 // Subroutine sub_00000A08 - Address 0x00000A08
 /*
  * End the wait of thread. If dispatch is set, the thread is made ready and a reschedule is requested,
@@ -217,20 +231,26 @@ void sub_00000A08(SceThreadmanThread *thread, s32 dispatch, s32 intr)
         return;
     }
     thread->status = SCE_THREADMAN_STATUS_READY;
-    if (dispatch) {
+    if (!dispatch)
+        sub_00016C48(thread, intr);
+    else {
         sub_000127D0(thread);
         g_threadman.nextThread = NULL;
-    } else
-        sub_00016C48(thread, intr);
+    }
 }
 
+/*
+ * PARITY-Q051 (38fcebd): Access through a local/named pointer (the original's addressing).
+ */
 // Subroutine sub_00000B08 - Address 0x00000B08
 /* End the wait of the first thread waiting on uid with the wait status waitStatus. See sub_00000A08(). */
 void sub_00000B08(SceSysmemUidCB *uid, s32 waitStatus, s32 dispatch, s32 intr)
 {
+    SceThreadmanWaitQ *waitQ;
     SceThreadmanThread *thread;
 
-    thread = (SceThreadmanThread *)UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ)->waitList.next;
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    thread = (SceThreadmanThread *)waitQ->waitList.next;
     thread->waitStatus = waitStatus;
     sub_00000A08(thread, dispatch, intr);
 }
@@ -249,6 +269,10 @@ void sub_00000BC4(SceThreadmanThread *thread)
     _sceKernelEndWait(thread);
 }
 
+/*
+ * PARITY-Q023: a plain (non-inline) function so GCC 3.3 emits it at its original address (inline functions are
+ * deferred to EOF)
+ */
 // Subroutine sub_00000C30 - Address 0x00000C30
 /* Wake up the threads waiting on uid whose wait condition is now satisfied. Return their number. */
 s32 sub_00000C30(SceSysmemUidCB *uid)
@@ -282,13 +306,16 @@ static void sub_00000C8C(void *common)
 
     needDispatch = _sceKernelReleaseWait(thread);
     if (thread->waitObj != NULL)
-        needDispatch += sub_00000C30(thread->waitObj);
+        needDispatch += sceKernelCallUIDObjFunction(thread->waitObj, SCE_THREADMAN_UID_FUNC_WAITQ_WAKEUP_WAITERS);
     if (needDispatch)
         g_threadman.nextThread = NULL;
 
     sceKernelCpuResumeIntr(intr);
 }
 
+/*
+ * PARITY-Q039 (e85a6d8): List heads initialised with threadmanListInit (the original's store pattern).
+ */
 // Subroutine sub_00000DC8 - Address 0x00000DC8
 static s32 _sceKernelWaitQInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
 {
@@ -296,11 +323,10 @@ static s32 _sceKernelWaitQInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWit
 
     sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
     waitQ = UID_CB_TO_DATA(uid, uidWithFunc, SceThreadmanWaitQ);
-    waitQ->unk4 = 0;
+    waitQ->firstServing = 0;
     waitQ->numWaitThreads = 0;
     waitQ->attr = 0;
-    waitQ->waitList.next = &waitQ->waitList;
-    waitQ->waitList.prev = &waitQ->waitList;
+    threadmanListInit(&waitQ->waitList);
     return uid->uid;
 }
 
@@ -340,14 +366,26 @@ static s32 _sceKernelWaitQWakeupWaiters(SceSysmemUidCB *uid __attribute__((unuse
     return 0;
 }
 
+/*
+ * PARITY-Q051 (38fcebd): Access through a local/named pointer (the original's addressing).
+ */
 // Subroutine sub_00000FC4 - Address 0x00000FC4
 static s32 _sceKernelWaitQEndWait(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc,
     s32 funcId __attribute__((unused)), va_list ap __attribute__((unused)))
 {
-    UID_CB_TO_DATA(uid, uidWithFunc, SceThreadmanWaitQ)->numWaitThreads--;
+    SceThreadmanWaitQ *waitQ;
+
+    waitQ = UID_CB_TO_DATA(uid, uidWithFunc, SceThreadmanWaitQ);
+    waitQ->numWaitThreads--;
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q114: the intr path is written first and the deferred (!intr) switch in the else branch. As for Q113,
+ * -frename-registers follows insn order, so with the !intr block last the temporaries of the switch path
+ * get $a1/$a2, $a3/$v1/$t0, $t1-$t4 as in the original. Same output: `if (intr) { ...; return; }` and
+ * a nested `if (!dispatchSuspended)`. Residue: the deferred block's mfc0/ori/mtc0 use $t6/$t5, not $v0.
+ */
 // Subroutine sub_00000FE4 - Address 0x00000FE4
 /*
  * Switch to the next thread. release is set when the current thread releases the CPU (by waiting) rather
@@ -368,19 +406,19 @@ void sub_00000FE4(s32 release, s32 intr)
         reason = 1;
     }
 
-    if (!intr) {
+    if (intr) {
+        if (g_threadman.dispatchSuspended)
+            return;
+
+        threadmanProfilerPause();
+        if (SaveThreadContext(thread->context) == 0)
+            InterruptManagerForKernel_551097F2(sub_00012828(thread->context, reason));
+        thread->waitWithCallbacks = 0;
+        threadmanProfilerResume();
+    } else {
         pspCop0StateSet(COP0_STATE_CAUSE, pspCop0StateGet(COP0_STATE_CAUSE) | 0x200);
         sceKernelEnableIntr(SCE_THREAD1_INT);
-        return;
     }
-    if (g_threadman.dispatchSuspended)
-        return;
-
-    threadmanProfilerPause();
-    if (SaveThreadContext(thread->context) == 0)
-        InterruptManagerForKernel_551097F2(sub_00012828(thread->context, reason));
-    thread->waitWithCallbacks = 0;
-    threadmanProfilerResume();
 }
 
 // Subroutine sub_00001100 - Address 0x00001100

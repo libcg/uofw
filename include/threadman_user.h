@@ -17,9 +17,12 @@ typedef struct {
 	s32 lockCount; // 0
 	s32 thid; // 4
 	u32 flags; // 8
-	s32 unk3; // 12
+	/* The number of threads waiting on the mutex (PPSSPP NativeLwMutexWorkarea.numWaitThreads; the user unlock
+	   only does the unlock syscall when it is not zero). */
+	s32 numWaitThreads; // 12
 	s32 id; // 16
-	u32 unk20[3]; // 20
+	/* Unused (PPSSPP NativeLwMutexWorkarea.pad). */
+	u32 pad[3]; // 20
 } SceLwMutex; // size: 32
 
 typedef struct {

@@ -30,7 +30,7 @@
 #define SCE_THREADMAN_MUTEX_NO_PRIORITY (0x7F)
 
 static void _sceKernelMutexLock(SceSysmemUidCB *uid, SceThreadmanThread *thread, s32 count);
-static s32 _sceKernelLockMutex(SceUID mutexId, s32 count, SceUInt *timeout, s32 withCallbacks);
+static s32 __attribute__((used)) _sceKernelLockMutex(SceUID mutexId, s32 count, SceUInt *timeout);
 static void _sceKernelMutexUnlock(SceSysmemUidCB *uid);
 static s32 _sceKernelMutexInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelMutexDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
@@ -44,6 +44,24 @@ SceSysmemUidLookupFunc g_MutexFuncs[] = {
     { 0, NULL }
 };
 
+/*
+ * PARITY-Q037 (cf293fa): UID attr | (k1 >> 31) passed to sceKernelCreateUID, as the original computes it.
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q051 (173e6b7): Access through a local/named pointer (the original's addressing).
+ * PARITY-Q079 (a72237c): memcpy() destination named through g_threadman, not the option local (the original
+ *     re-derives that address from the %hi part).
+ * PARITY-Q085: Creation failure returns through its own resume/return tail (success path dedented).
+ * PARITY-Q087: the new UID kept in its own `id` local instead of reusing the CreateUID status. csim only, still equiv
+ *     (intr is still spilled to the stack).
+ * PARITY-Q123: option ceilingPriority cleared before size, and lockCount set before initCount. With this order the
+ *     scheduler emits the original's store order (size, then ceilingPriority; initCount, then lockCount). wsim
+ *     only, still equiv (intr is still spilled).
+ */
+/*
+ * PARITY-Q144: the mutex data pointer is computed before the wait queue's, and the uid is stored last (after
+ *     owner, initCount, lockCount). The original loads the mutex type's size first and stores initCount after
+ *     the uid; GCC's scheduler reverses both relative to the source order. Plain C.
+ */
 /**
  * Create a mutex.
  *
@@ -60,11 +78,13 @@ s32 sceKernelCreateMutex(char *name, s32 attr, s32 initCount, const SceKernelMut
     s32 oldK1;
     s32 intr;
     s32 status;
+    SceUID id;
     s32 priority;
     SceSysmemUidCB *uid;
     SceThreadmanThread *thread;
     SceThreadmanMutex *mutex;
     SceThreadmanWaitQ *waitQ;
+    SceKernelMutexOptParam *option = &g_threadman.statusBuf.mutexOption;
 
     oldK1 = pspShiftK1();
     if (!pspK1PtrOk(name) || !pspK1StaBufOk(pOption, 8)) {
@@ -75,8 +95,11 @@ s32 sceKernelCreateMutex(char *name, s32 attr, s32 initCount, const SceKernelMut
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_CANNOT_BE_CALLED_FROM_INTERRUPT;
     }
-    if ((attr & ~SCE_THREADMAN_MUTEX_ATTR_MASK) != 0
-        || (pspK1IsUserMode() && (attr & SCE_THREADMAN_MUTEX_ATTR_PRIORITY_CEILING))) {
+    if ((attr & ~SCE_THREADMAN_MUTEX_ATTR_MASK) != 0) {
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_ILLEGAL_ATTR;
+    }
+    if (pspK1IsUserMode() && (attr & SCE_THREADMAN_MUTEX_ATTR_PRIORITY_CEILING)) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_ATTR;
     }
@@ -87,8 +110,8 @@ s32 sceKernelCreateMutex(char *name, s32 attr, s32 initCount, const SceKernelMut
 
     intr = sceKernelCpuSuspendIntr();
 
-    g_threadman.statusBuf.mutexOption.size = 0;
-    g_threadman.statusBuf.mutexOption.ceilingPriority = 0;
+    option->ceilingPriority = 0;
+    option->size = 0;
     if (pOption != NULL)
         memcpy(&g_threadman.statusBuf.mutexOption, pOption, (pOption->size < 9) ? pOption->size : 8);
 
@@ -99,33 +122,41 @@ s32 sceKernelCreateMutex(char *name, s32 attr, s32 initCount, const SceKernelMut
         if (priority == 0)
             priority = thread->currentPriority;
         /* A thread creating a locked mutex must not already run above its ceiling priority. */
-        if (!THREADMAN_IS_VALID_PRIORITY(priority) || (initCount > 0 && thread->basePriority < priority)) {
+        if (!THREADMAN_IS_VALID_PRIORITY(priority)) {
+            sceKernelCpuResumeIntr(intr);
+            pspSetK1(oldK1);
+            return SCE_ERROR_KERNEL_ILLEGAL_PRIORITY;
+        }
+        if (initCount > 0 && thread->basePriority < priority) {
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_ILLEGAL_PRIORITY;
         }
     }
 
-    status = sceKernelCreateUID(g_threadman.mutexType, name, (pspGetK1() >> 31) | attr, &uid);
-    if (status == SCE_ERROR_OK) {
-        waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
-        mutex = UID_CB_TO_DATA(uid, g_threadman.mutexType, SceThreadmanMutex);
-        status = uid->uid;
-        waitQ->attr = attr;
-        mutex->option = pOption;
-        mutex->ceilingPriority = priority;
-        mutex->uid = status;
-        mutex->owner = NULL;
-        mutex->initCount = initCount;
-        mutex->lockCount = initCount;
-        if (initCount > 0)
-            _sceKernelMutexLock(uid, thread, initCount);
-        THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_MUTEX, 1, status);
+    status = sceKernelCreateUID(g_threadman.mutexType, name, attr | (pspGetK1() >> 31), &uid);
+    if (status != SCE_ERROR_OK) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return status;
     }
+    mutex = UID_CB_TO_DATA(uid, g_threadman.mutexType, SceThreadmanMutex);
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    id = uid->uid;
+    waitQ->attr = attr;
+    mutex->option = pOption;
+    mutex->ceilingPriority = priority;
+    mutex->owner = NULL;
+    mutex->initCount = initCount;
+    mutex->lockCount = initCount;
+    mutex->uid = id;
+    if (initCount > 0)
+        _sceKernelMutexLock(uid, thread, initCount);
+    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_MUTEX, 1, id);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
-    return status;
+    return id;
 }
 
 /**
@@ -170,6 +201,10 @@ s32 sceKernelDeleteMutex(SceUID mutexId)
 }
 
 /*
+ * PARITY-Q065: Guard and arm shape taken from the original's layout (positive priority-ceiling guard, plain
+ *     add in the else arm).
+ */
+/*
  * Make thread the owner of a mutex with the lock count count, raising the priority of the thread to the
  * ceiling priority of the mutex if needed.
  */
@@ -184,24 +219,27 @@ static void _sceKernelMutexLock(SceSysmemUidCB *uid, SceThreadmanThread *thread,
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     mutex->lockCount = count;
     mutex->owner = thread;
-    if ((waitQ->attr & SCE_THREADMAN_MUTEX_ATTR_PRIORITY_CEILING) == 0) {
+    if ((waitQ->attr & SCE_THREADMAN_MUTEX_ATTR_PRIORITY_CEILING) != 0) {
+        /* Keep the owned mutexes sorted by ceiling priority, the highest priority first. */
+        for (entry = thread->ownedMutexes.next; entry != &thread->ownedMutexes; entry = entry->next) {
+            if (mutex->ceilingPriority < ((SceThreadmanMutex *)entry)->ceilingPriority)
+                break;
+        }
+        threadmanListAddTail(entry, &mutex->ownerLink);
+
+        if (mutex->ceilingPriority < thread->mutexPriority)
+            thread->mutexPriority = mutex->ceilingPriority;
+        if (thread->mutexPriority < thread->currentPriority)
+            sub_00014598(thread, thread->mutexPriority, 0);
+    } else
         threadmanListAddTail(&thread->ownedMutexes, &mutex->ownerLink);
-        return;
-    }
-
-    /* Keep the owned mutexes sorted by ceiling priority, the highest priority first. */
-    for (entry = thread->ownedMutexes.next; entry != &thread->ownedMutexes; entry = entry->next) {
-        if (mutex->ceilingPriority < ((SceThreadmanMutex *)entry)->ceilingPriority)
-            break;
-    }
-    threadmanListAddTail(entry, &mutex->ownerLink);
-
-    if (mutex->ceilingPriority < thread->mutexPriority)
-        thread->mutexPriority = mutex->ceilingPriority;
-    if (thread->mutexPriority < thread->currentPriority)
-        sub_00014598(thread, thread->mutexPriority, 0);
 }
 
+/*
+ * PARITY-Q042 (1d26f02): Statement/store order taken from the original's store order.
+ * PARITY-Q050 (1d26f02): Loop shape (guarded block instead of continue / separate next cursor / head pointer walk) as
+ *     the original's layout.
+ */
 /**
  * Release the mutexes owned by an exiting thread: the mutexes with SCE_THREADMAN_MUTEX_ATTR_KEEP_ON_EXIT stay
  * locked (their owner becomes SCE_THREADMAN_MUTEX_OWNER_EXITED), the others are unlocked and given to their
@@ -220,17 +258,18 @@ void _sceKernelMutexReleaseOwned(SceThreadmanThread *thread)
     SceThreadmanWaitQ *waitQ;
 
     reschedule = 0;
-    for (entry = thread->ownedMutexes.next; entry != &thread->ownedMutexes; entry = next) {
+    entry = thread->ownedMutexes.next;
+    while (entry != &thread->ownedMutexes) {
         mutex = (SceThreadmanMutex *)entry;
         uid = (SceSysmemUidCB *)((u32 *)mutex - g_threadman.mutexType->size);
         waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
-        next = entry->next;
-        threadmanListRemove(entry);
+        entry = entry->next;
+        threadmanListRemove(&mutex->ownerLink);
         if (waitQ->attr & SCE_THREADMAN_MUTEX_ATTR_KEEP_ON_EXIT) {
             mutex->owner = SCE_THREADMAN_MUTEX_OWNER_EXITED;
         } else {
-            mutex->lockCount = 0;
             mutex->owner = NULL;
+            mutex->lockCount = 0;
             reschedule += sub_00000C30(uid);
         }
     }
@@ -246,6 +285,13 @@ void _sceKernelMutexReleaseOwned(SceThreadmanThread *thread)
     }
 }
 
+/*
+ * PARITY-Q046 (1598082): Object pointer derived before waitQ (the original loads the object's type word first).
+ * PARITY-Q051: curThread read into a local after the mutex/waitQ pointers (the original loads it in the delay
+ *     slot of the count check, before the owner test).
+ * PARITY-Q083: still-locked case as `goto end` (goto prediction: the original's block frequencies, hence its $s1/$s2
+ *     allocation).
+ */
 /**
  * Unlock a mutex owned by the current thread. When its lock count reaches 0, the mutex is given to the first
  * waiting thread, if any.
@@ -267,6 +313,7 @@ s32 sceKernelUnlockMutex(SceUID mutexId, s32 unlockCount)
     SceThreadmanWaitQ *waitQ;
     SceThreadmanThread *thread;
     SceThreadmanThread *wokenUpThread;
+    SceThreadmanThread *curThread;
 
     oldK1 = pspShiftK1();
     wokenUpThread = NULL;
@@ -288,14 +335,15 @@ s32 sceKernelUnlockMutex(SceUID mutexId, s32 unlockCount)
         return SCE_ERROR_KERNEL_ILLEGAL_PERMISSION;
     }
 
-    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     mutex = UID_CB_TO_DATA(uid, g_threadman.mutexType, SceThreadmanMutex);
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    curThread = g_threadman.curThread;
     if (unlockCount <= 0 || (unlockCount >= 2 && (waitQ->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE) == 0)) {
         pspSetK1(oldK1);
         sceKernelCpuResumeIntr(intr);
         return SCE_ERROR_KERNEL_ILLEGAL_COUNT;
     }
-    if (mutex->owner != g_threadman.curThread) {
+    if (mutex->owner != curThread) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_MUTEX_UNLOCKED;
@@ -310,28 +358,33 @@ s32 sceKernelUnlockMutex(SceUID mutexId, s32 unlockCount)
     }
     newCount = mutex->lockCount - unlockCount;
     mutex->lockCount = newCount;
-    if (newCount <= 0) {
-        _sceKernelMutexUnlock(uid);
-        wokenUp = 0;
-        /* Give the mutex to the first waiting thread. */
-        for (thread = (SceThreadmanThread *)waitQ->waitList.next;
-             thread != (SceThreadmanThread *)&waitQ->waitList; thread = (SceThreadmanThread *)thread->link.next) {
-            if (g_threadman.skipUserThreads
-                && (THREADMAN_IS_USER_THREAD(thread) || (thread->attr & SCE_THREADMAN_THREAD_ATTR_UNK_08000000)))
-                continue;
-            _sceKernelMutexLock(uid, thread, thread->waitData[0]);
-            if (sub_00000924(thread) > 0) {
-                wokenUpThread = thread;
-                wokenUp = 1;
-            }
-            break;
+    if (newCount > 0)
+        goto end;
+    _sceKernelMutexUnlock(uid);
+    wokenUp = 0;
+    /* Give the mutex to the first waiting thread. */
+    for (thread = (SceThreadmanThread *)waitQ->waitList.next;
+         thread != (SceThreadmanThread *)&waitQ->waitList; thread = (SceThreadmanThread *)thread->link.next) {
+        /*
+         * PARITY-Q015: skipUserThreads is predicted false so the skip test's block layout matches
+         * the original
+         */
+        if (__builtin_expect(g_threadman.skipUserThreads != 0, 0)
+            && (THREADMAN_IS_USER_THREAD(thread) || (thread->attr & SCE_THREADMAN_THREAD_ATTR_UNK_08000000)))
+            continue;
+        _sceKernelMutexLock(uid, thread, thread->waitData[0]);
+        if (sub_00000924(thread) > 0) {
+            wokenUpThread = thread;
+            wokenUp = 1;
         }
-        if (wokenUp == 1) {
-            sub_00016BF4(wokenUpThread, wokenUpThread->currentPriority);
-            sub_00016C48(wokenUpThread, intr);
-        }
+        break;
+    }
+    if (wokenUp == 1) {
+        sub_00016BF4(wokenUpThread, wokenUpThread->currentPriority);
+        sub_00016C48(wokenUpThread, intr);
     }
 
+end:
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
@@ -347,10 +400,7 @@ s32 sceKernelUnlockMutex(SceUID mutexId, s32 unlockCount)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelLockMutex - Address 0x00006A6C
-s32 sceKernelLockMutex(SceUID mutexId, s32 lockCount, u32 *pTimeout)
-{
-    return _sceKernelLockMutex(mutexId, lockCount, pTimeout, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelLockMutex, _sceKernelLockMutex, 0);
 
 /**
  * Lock a mutex, waiting until it is available and running the callbacks notified meanwhile.
@@ -362,18 +412,18 @@ s32 sceKernelLockMutex(SceUID mutexId, s32 lockCount, u32 *pTimeout)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelLockMutexCB - Address 0x00006A74
-s32 sceKernelLockMutexCB(SceUID mutexId, s32 lockCount, u32 *pTimeout)
-{
-    return _sceKernelLockMutex(mutexId, lockCount, pTimeout, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelLockMutexCB, _sceKernelLockMutex, 1);
 
+/*
+ * PARITY-Q056 (c3b7a81): Must-wait priority checks as if / else if (the original's branch chain).
+ */
 // Subroutine sub_00006A7C - Address 0x00006A7C
-static s32 _sceKernelLockMutex(SceUID mutexId, s32 count, SceUInt *timeout, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelLockMutex(SceUID mutexId, s32 count, SceUInt *timeout)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     s32 status;
-    s32 newCount;
     s32 mustWait;
     SceKernelSysClock timeoutClock;
     SceSysmemUidCB *uid;
@@ -434,13 +484,17 @@ static s32 _sceKernelLockMutex(SceUID mutexId, s32 count, SceUInt *timeout, s32 
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_MUTEX_RECURSIVE_NOT_ALLOWED;
         }
-        newCount = count + mutex->lockCount;
-        if (newCount < 0) {
+        /*
+         * PARITY-Q177: The new lock count is accumulated in count itself (no separate newCount): the original
+         *     keeps it in count's register ($s5) across the overflow check and store. Whole function exact.
+         */
+        count += mutex->lockCount;
+        if (count < 0) {
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_MUTEX_LOCK_OVERFLOW;
         }
-        mutex->lockCount = newCount;
+        mutex->lockCount = count;
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_OK;
@@ -464,11 +518,16 @@ static s32 _sceKernelLockMutex(SceUID mutexId, s32 count, SceUInt *timeout, s32 
         if (waitQ->numWaitThreads > 0) {
             for (waiter = (SceThreadmanThread *)waitQ->waitList.next;
                  waiter != (SceThreadmanThread *)&waitQ->waitList; waiter = (SceThreadmanThread *)waiter->link.next) {
-                if (g_threadman.skipUserThreads
+                /*
+                 * PARITY-Q015: skipUserThreads is predicted false so the skip test's block layout
+                 * matches the original
+                 */
+                if (__builtin_expect(g_threadman.skipUserThreads != 0, 0)
                     && (THREADMAN_IS_USER_THREAD(waiter) || (waiter->attr & SCE_THREADMAN_THREAD_ATTR_UNK_08000000)))
                     continue;
-                if ((waitQ->attr & SCE_THREADMAN_WAITQ_ATTR_PRIORITY) == 0
-                    || waiter->currentPriority <= thread->currentPriority)
+                if ((waitQ->attr & SCE_THREADMAN_WAITQ_ATTR_PRIORITY) == 0)
+                    mustWait = 1;
+                else if (waiter->currentPriority <= thread->currentPriority)
                     mustWait = 1;
                 break;
             }
@@ -488,6 +547,9 @@ static s32 _sceKernelLockMutex(SceUID mutexId, s32 count, SceUInt *timeout, s32 
     return status;
 }
 
+/*
+ * PARITY-Q042 (096181d): Statement/store order taken from the original's store order.
+ */
 /**
  * Lock a mutex without waiting.
  *
@@ -501,7 +563,6 @@ s32 sceKernelTryLockMutex(SceUID mutexId, s32 lockCount)
 {
     s32 oldK1;
     s32 intr;
-    s32 newCount;
     SceSysmemUidCB *uid;
     SceThreadmanMutex *mutex;
     SceThreadmanWaitQ *waitQ;
@@ -520,15 +581,15 @@ s32 sceKernelTryLockMutex(SceUID mutexId, s32 lockCount)
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_MUTEX_NOT_FOUND;
     }
-    thread = g_threadman.curThread;
     if (!THREADMAN_UID_PERM_OK(uid, SCE_THREADMAN_UID_ATTR_SIGNAL)) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_PERMISSION;
     }
 
-    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    thread = g_threadman.curThread;
     mutex = UID_CB_TO_DATA(uid, g_threadman.mutexType, SceThreadmanMutex);
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     if (lockCount <= 0 || (lockCount >= 2 && (waitQ->attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE) == 0)) {
         pspSetK1(oldK1);
         sceKernelCpuResumeIntr(intr);
@@ -544,13 +605,13 @@ s32 sceKernelTryLockMutex(SceUID mutexId, s32 lockCount)
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_MUTEX_RECURSIVE_NOT_ALLOWED;
         }
-        newCount = lockCount + mutex->lockCount;
-        if (newCount < 0) {
+        lockCount += mutex->lockCount;
+        if (lockCount < 0) {
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_MUTEX_LOCK_OVERFLOW;
         }
-        mutex->lockCount = newCount;
+        mutex->lockCount = lockCount;
     } else if (mutex->owner != NULL) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
@@ -647,7 +708,6 @@ s32 sceKernelReferMutexStatus(SceUID mutexId, SceKernelMutexInfo *pInfo)
 {
     s32 oldK1;
     s32 intr;
-    u32 *ptr;
     SceSysmemUidCB *uid;
     SceThreadmanMutex *mutex;
     SceThreadmanWaitQ *waitQ;
@@ -677,8 +737,8 @@ s32 sceKernelReferMutexStatus(SceUID mutexId, SceKernelMutexInfo *pInfo)
     mutex = UID_CB_TO_DATA(uid, g_threadman.mutexType, SceThreadmanMutex);
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     buf = &g_threadman.statusBuf.mutexInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     if (uid->name != NULL)
         strncpy(buf->name, uid->name, SCE_UID_NAME_LEN);
@@ -692,7 +752,7 @@ s32 sceKernelReferMutexStatus(SceUID mutexId, SceKernelMutexInfo *pInfo)
         buf->currentOwner = mutex->owner->uid;
     buf->currentCount = mutex->lockCount;
     buf->initCount = mutex->initCount;
-    memcpy(pInfo, buf, (buf->size < pInfo->size) ? buf->size : pInfo->size);
+    THREADMAN_COPY_STATUS(pInfo, &g_threadman.statusBuf.mutexInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -715,6 +775,14 @@ s32 _sceKernelMutexInit(void)
  * Unlock a mutex (lock count 0, no owner) and remove it from the owned mutexes of its owner, whose priority is
  * lowered back to the ceiling priority of the mutexes it still owns, or to its base priority.
  */
+/*
+ * PARITY-Q048 (fe568a5): Value read once into a local (the original keeps it in one register).
+ * PARITY-Q049 (67a73b6): If/else statements instead of ternaries (the original branches, no movz/movn).
+ * PARITY-Q057 (a5007fb): The first owned mutex's UID CB computed into uid before UID_CB_TO_DATA (the original's
+ *     order).
+ * PARITY-Q065 (67a73b6): Guard and arm shape taken from the original's layout (wait arm first, positive guards, addr
+ *     != NULL block).
+ */
 // Subroutine sub_00007480 - Address 0x00007480
 static void _sceKernelMutexUnlock(SceSysmemUidCB *uid)
 {
@@ -728,23 +796,27 @@ static void _sceKernelMutexUnlock(SceSysmemUidCB *uid)
     owner = mutex->owner;
     mutex->lockCount = 0;
     mutex->owner = NULL;
-    if (owner == NULL || owner == SCE_THREADMAN_MUTEX_OWNER_EXITED)
-        return;
-
+    if (owner != NULL && owner != SCE_THREADMAN_MUTEX_OWNER_EXITED) {
     threadmanListRemove(&mutex->ownerLink);
     first = (SceThreadmanMutex *)owner->ownedMutexes.next;
     if (&first->ownerLink != &owner->ownedMutexes) {
-        waitQ = UID_CB_TO_DATA((SceSysmemUidCB *)((u32 *)first - g_threadman.mutexType->size), g_threadman.waitQType, SceThreadmanWaitQ);
+        /* The UID control block of the first owned mutex. */
+        uid = (SceSysmemUidCB *)((u32 *)first - g_threadman.mutexType->size);
+        waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
         if (waitQ->attr & SCE_THREADMAN_MUTEX_ATTR_PRIORITY_CEILING) {
             /* The first owned mutex has the highest ceiling priority. */
-            owner->mutexPriority = first->ceilingPriority;
-            priority = (first->ceilingPriority < owner->basePriority) ? first->ceilingPriority : owner->basePriority;
-            sub_00014598(owner, priority, 0);
+            priority = first->ceilingPriority;
+            owner->mutexPriority = priority;
+            if (priority < owner->basePriority)
+                sub_00014598(owner, priority, 0);
+            else
+                sub_00014598(owner, owner->basePriority, 0);
             return;
         }
     }
     owner->mutexPriority = SCE_THREADMAN_MUTEX_NO_PRIORITY;
     sub_00014598(owner, owner->basePriority, 0);
+    }
 }
 
 // Subroutine sub_0000755C - Address 0x0000755C
@@ -783,7 +855,11 @@ static s32 _sceKernelMutexWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uid
 
     for (thread = (SceThreadmanThread *)waitQ->waitList.next;
          thread != (SceThreadmanThread *)&waitQ->waitList; thread = (SceThreadmanThread *)thread->link.next) {
-        if (g_threadman.skipUserThreads
+        /*
+         * PARITY-Q015: skipUserThreads is predicted false so the skip test's block layout matches the
+         * original
+         */
+        if (__builtin_expect(g_threadman.skipUserThreads != 0, 0)
             && (THREADMAN_IS_USER_THREAD(thread) || (thread->attr & SCE_THREADMAN_THREAD_ATTR_UNK_08000000)))
             continue;
         if (mutex->owner != NULL)

@@ -26,7 +26,7 @@
 /** The valid fixed-length memory pool attributes. */
 #define SCE_THREADMAN_FPL_ATTR_MASK     (0x41FF)
 
-static s32 _sceKernelAllocateFpl(SceUID uid, void **data, unsigned int *timeout, s32 withCallbacks);
+static s32 __attribute__((used)) _sceKernelAllocateFpl(SceUID uid, void **data, unsigned int *timeout);
 static s32 _sceKernelFplFreeBlock(SceThreadmanFpl *fpl, s32 index);
 static s32 _sceKernelFplAllocBlock(SceThreadmanFpl *fpl);
 static s32 _sceKernelFplInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
@@ -39,6 +39,21 @@ SceSysmemUidLookupFunc g_FplFuncs[] = {
     { 0, NULL }
 };
 
+/*
+ * PARITY-Q037 (cf293fa): UID attr | (k1 >> 31) passed to sceKernelCreateUID, as the original computes it.
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (8248a90): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ * PARITY-Q045 (58379bc): The new UID kept in a local id read before the data pointer (the original's register use).
+ * PARITY-Q046 (1598082): Object pointer derived before waitQ (the original loads the object's type word first).
+ * PARITY-Q049 (b8fea45): If/else statements instead of ternaries (the original branches, no movz/movn).
+ * PARITY-Q132: links, size, then blockSize (structure offset order 12, 20, 28) after the inline-links block. The
+ *     blockSize store used to come first; with this order the callee-saved assignment and the post-CreateUID
+ *     schedule follow the original (equiv -> sched). Residue: two s-register swaps ($s6/$s7, $s0/$s1).
+ * PARITY-Q133: option and blockId are set before blockSize, so the block fields read blockId, blockSize,
+ *     numBlocks (parameter order). Same 1 up as blockSize after numBlocks or after lastFree; this grouping was
+ *     taken as the most natural. Still sched (register residue as above).
+ */
 /**
  * Create a fixed-length memory pool.
  *
@@ -58,6 +73,7 @@ int sceKernelCreateFpl(const char *name, int part, int attr, unsigned int size, 
     s32 oldK1;
     s32 intr;
     s32 status;
+    SceUID id;
     s32 i;
     u32 type;
     SceSize alignment;
@@ -85,7 +101,7 @@ int sceKernelCreateFpl(const char *name, int part, int attr, unsigned int size, 
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_ATTR;
     }
-    if ((s32)blocks <= 0 || size == 0) {
+    if (size == 0 || (s32)blocks <= 0) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_MEMSIZE;
     }
@@ -135,8 +151,9 @@ int sceKernelCreateFpl(const char *name, int part, int attr, unsigned int size, 
     }
 
     /* The links of the first two blocks are stored in the pool itself. */
-    links = NULL;
-    if ((s32)blocks >= 3) {
+    if ((s32)blocks < 3)
+        links = NULL;
+    else {
         links = sceKernelAllocHeapMemory(g_threadman.heapId, blocks * sizeof(*links));
         if (links == NULL) {
             sceKernelCpuResumeIntr(intr);
@@ -156,7 +173,7 @@ int sceKernelCreateFpl(const char *name, int part, int attr, unsigned int size, 
     }
     base = sceKernelGetBlockHeadAddr(blockId);
 
-    status = sceKernelCreateUID(g_threadman.fplType, name, (pspGetK1() >> 31) | attr, &uid);
+    status = sceKernelCreateUID(g_threadman.fplType, name, attr | (pspGetK1() >> 31), &uid);
     if (status != SCE_ERROR_OK) {
         if (links != NULL)
             sceKernelFreeHeapMemory(g_threadman.heapId, links);
@@ -166,9 +183,9 @@ int sceKernelCreateFpl(const char *name, int part, int attr, unsigned int size, 
         return status;
     }
 
-    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     fpl = UID_CB_TO_DATA(uid, g_threadman.fplType, SceThreadmanFpl);
-    status = uid->uid;
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    id = uid->uid;
     fpl->base = base;
     waitQ->attr = attr;
     if (links == NULL) {
@@ -176,20 +193,20 @@ int sceKernelCreateFpl(const char *name, int part, int attr, unsigned int size, 
         fpl->inlineLinks[1].next = NULL;
         links = fpl->inlineLinks;
     }
-    fpl->blockSize = blockSize;
     fpl->links = links;
     fpl->size = size;
+    fpl->blockSize = blockSize; /* PARITY-Q204: stored after size (original store order) */
     fpl->option = opt;
     fpl->blockId = blockId;
     fpl->numBlocks = blocks;
     fpl->lastFree = NULL;
     for (i = 0; i < (s32)blocks; i++)
         _sceKernelFplFreeBlock(fpl, i);
-    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_FPL, 1, status);
+    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_FPL, 1, id);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
-    return status;
+    return id;
 }
 
 /**
@@ -244,10 +261,7 @@ int sceKernelDeleteFpl(SceUID uid)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelAllocateFpl - Address 0x0000C940
-int sceKernelAllocateFpl(SceUID uid, void **data, unsigned int *timeout)
-{
-    return _sceKernelAllocateFpl(uid, data, timeout, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelAllocateFpl, _sceKernelAllocateFpl, 0);
 
 /**
  * Allocate a block from a fixed-length memory pool, waiting until one is available and running the
@@ -260,18 +274,22 @@ int sceKernelAllocateFpl(SceUID uid, void **data, unsigned int *timeout)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelAllocateFplCB - Address 0x0000C948
-int sceKernelAllocateFplCB(SceUID uid, void **data, unsigned int *timeout)
-{
-    return _sceKernelAllocateFpl(uid, data, timeout, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelAllocateFplCB, _sceKernelAllocateFpl, 1);
 
 /*
  * Common part of sceKernelAllocateFpl() and sceKernelAllocateFplCB().
  * Note: the original passes withCallbacks in $t3.
  */
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (e093285): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ * PARITY-Q046 (8f30c3a): Object pointer derived before waitQ (the original loads the object's type word first).
+ */
 // Subroutine sub_0000C950 - Address 0x0000C950
-static s32 _sceKernelAllocateFpl(SceUID uid, void **data, unsigned int *timeout, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelAllocateFpl(SceUID uid, void **data, unsigned int *timeout)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     s32 status;
@@ -313,8 +331,8 @@ static s32 _sceKernelAllocateFpl(SceUID uid, void **data, unsigned int *timeout,
     }
 
     thread = g_threadman.curThread;
-    waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
     fpl = UID_CB_TO_DATA(cb, g_threadman.fplType, SceThreadmanFpl);
+    waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
     if (withCallbacks) {
         THREADMAN_LOG(SCE_THREADMAN_LOG_ALLOCATE_FPL_CB, 1, uid);
     } else {
@@ -404,6 +422,11 @@ int sceKernelTryAllocateFpl(SceUID uid, void **data)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (c823030, a9f295b): Checks combined in one condition / merged identical error checks: the original
+ *     shares one branch.
+ */
 /**
  * Free a block of a fixed-length memory pool. The block is given to the first waiting thread, if any.
  *
@@ -455,7 +478,12 @@ int sceKernelFreeFpl(SceUID uid, void *data)
         return SCE_ERROR_KERNEL_ILLEGAL_MEMBLOCK;
     }
     index = (s32)((u8 *)data - fpl->base) / (s32)fpl->blockSize;
-    if ((u8 *)data != fpl->base + fpl->blockSize * index || fpl->links[index].next != NULL) {
+    if ((u8 *)data != fpl->base + fpl->blockSize * index) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_ILLEGAL_MEMBLOCK;
+    }
+    if (fpl->links[index].next != NULL) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_MEMBLOCK;
@@ -534,7 +562,6 @@ int sceKernelReferFplStatus(SceUID uid, SceKernelFplInfo *info)
 {
     s32 oldK1;
     s32 intr;
-    u32 *ptr;
     SceSysmemUidCB *cb;
     SceThreadmanFpl *fpl;
     SceThreadmanWaitQ *waitQ;
@@ -564,8 +591,8 @@ int sceKernelReferFplStatus(SceUID uid, SceKernelFplInfo *info)
     fpl = UID_CB_TO_DATA(cb, g_threadman.fplType, SceThreadmanFpl);
     waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
     buf = &g_threadman.statusBuf.fplInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     if (cb->name != NULL)
         strncpy(buf->name, cb->name, SCE_UID_NAME_LEN);
@@ -574,7 +601,7 @@ int sceKernelReferFplStatus(SceUID uid, SceKernelFplInfo *info)
     buf->numBlocks = fpl->numBlocks;
     buf->freeBlocks = fpl->numFreeBlocks;
     buf->numWaitThreads = waitQ->numWaitThreads;
-    memcpy(info, buf, (buf->size < info->size) ? buf->size : info->size);
+    THREADMAN_COPY_STATUS(info, &g_threadman.statusBuf.fplInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -586,23 +613,28 @@ int sceKernelReferFplStatus(SceUID uid, SceKernelFplInfo *info)
  *
  * @return 0 on success, -1 if the block is already free.
  */
+/*
+ * PARITY-Q042 (60e3c5d): Statement/store order taken from the original's store order.
+ */
 // Subroutine sub_0000D2E4 - Address 0x0000D2E4
 static s32 _sceKernelFplFreeBlock(SceThreadmanFpl *fpl, s32 index)
 {
     SceThreadmanFplLink *link;
     SceThreadmanFplLink *last;
+    SceThreadmanFplLink *first;
 
     link = &fpl->links[index];
     if (link->next != NULL)
         return -1;
     fpl->numFreeBlocks++;
-    last = fpl->lastFree;
-    if (last == NULL) {
+    if (fpl->lastFree == NULL) {
         fpl->lastFree = link;
         link->next = link;
     } else {
+        last = fpl->lastFree;
+        first = last->next;
         fpl->lastFree = link;
-        link->next = last->next;
+        link->next = first;
         last->next = link;
     }
     return 0;
@@ -613,23 +645,28 @@ static s32 _sceKernelFplFreeBlock(SceThreadmanFpl *fpl, s32 index)
  *
  * @return 0 on success, -1 if the block is already free.
  */
+/*
+ * PARITY-Q042 (60e3c5d): Statement/store order taken from the original's store order.
+ */
 // Subroutine sub_0000D338 - Address 0x0000D338
 s32 _sceKernelTlsplFreeBlock(SceThreadmanTlspl *tlspl, s32 index)
 {
     SceThreadmanFplLink *link;
     SceThreadmanFplLink *last;
+    SceThreadmanFplLink *first;
 
     link = &tlspl->links[index];
     if (link->next != NULL)
         return -1;
     tlspl->numFreeBlocks++;
-    last = tlspl->lastFree;
-    if (last == NULL) {
+    if (tlspl->lastFree == NULL) {
         tlspl->lastFree = link;
         link->next = link;
     } else {
+        last = tlspl->lastFree;
+        first = last->next;
         tlspl->lastFree = link;
-        link->next = last->next;
+        link->next = first;
         last->next = link;
     }
     return 0;
@@ -640,24 +677,29 @@ s32 _sceKernelTlsplFreeBlock(SceThreadmanTlspl *tlspl, s32 index)
  *
  * @return The index of the block, or -1 if no block is free.
  */
+/*
+ * PARITY-Q042 (07d0a34): Statement/store order taken from the original's store order.
+ */
 // Subroutine sub_0000D38C - Address 0x0000D38C
 static s32 _sceKernelFplAllocBlock(SceThreadmanFpl *fpl)
 {
     SceThreadmanFplLink *last;
     SceThreadmanFplLink *first;
+    s32 index;
 
-    last = fpl->lastFree;
-    if (last == NULL)
+    if (fpl->lastFree == NULL)
         return -1;
+    last = fpl->lastFree;
     fpl->numFreeBlocks--;
     first = last->next;
     if (last == first)
         last = NULL;
     else
         last->next = first->next;
+    index = first - fpl->links;
     fpl->lastFree = last;
     first->next = NULL;
-    return first - fpl->links;
+    return index;
 }
 
 /*
@@ -665,24 +707,29 @@ static s32 _sceKernelFplAllocBlock(SceThreadmanFpl *fpl)
  *
  * @return The index of the block, or -1 if no block is free.
  */
+/*
+ * PARITY-Q042 (07d0a34): Statement/store order taken from the original's store order.
+ */
 // Subroutine sub_0000D3DC - Address 0x0000D3DC
 s32 _sceKernelTlsplAllocBlock(SceThreadmanTlspl *tlspl)
 {
     SceThreadmanFplLink *last;
     SceThreadmanFplLink *first;
+    s32 index;
 
-    last = tlspl->lastFree;
-    if (last == NULL)
+    if (tlspl->lastFree == NULL)
         return -1;
+    last = tlspl->lastFree;
     tlspl->numFreeBlocks--;
     first = last->next;
     if (last == first)
         last = NULL;
     else
         last->next = first->next;
+    index = first - tlspl->links;
     tlspl->lastFree = last;
     first->next = NULL;
-    return first - tlspl->links;
+    return index;
 }
 
 /*
@@ -690,13 +737,19 @@ s32 _sceKernelTlsplAllocBlock(SceThreadmanTlspl *tlspl)
  *
  * @return The UID of the pool, or -1 if not found.
  */
+/*
+ * PARITY-Q048 (905162f, e0f7084): Value read once into a local (the original keeps it in one register).
+ */
 // Subroutine sub_0000D42C - Address 0x0000D42C
 SceUID _sceKernelGetFplByBlockId(SceUID blockId)
 {
     SceSysmemUidCB *cb;
+    SceSysmemUidCB *type = g_threadman.fplType;
+    SceThreadmanFpl *fpl;
 
-    for (cb = g_threadman.fplType->PARENT0; cb != g_threadman.fplType; cb = cb->PARENT0) {
-        if (UID_CB_TO_DATA(cb, g_threadman.fplType, SceThreadmanFpl)->blockId == blockId)
+    for (cb = type->PARENT0; cb != type; cb = cb->PARENT0) {
+        fpl = UID_CB_TO_DATA(cb, type, SceThreadmanFpl);
+        if (fpl->blockId == blockId)
             return cb->uid;
     }
     return -1;

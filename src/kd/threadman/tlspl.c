@@ -37,6 +37,11 @@ SceSysmemUidLookupFunc g_TlsplFuncs[] = {
     { 0, NULL }
 };
 
+/*
+ * PARITY-Q037 (cf293fa): UID attr | (k1 >> 31) passed to sceKernelCreateUID, as the original computes it.
+ * PARITY-Q046 (1598082): Object pointer derived before waitQ (the original loads the object's type word first).
+ * PARITY-Q049 (aca415d): If/else statements instead of ternaries (the original branches, no movz/movn).
+ */
 /**
  * Create a TLS pool. Each thread gets its own block of the pool with _sceKernelAllocateTlspl().
  *
@@ -145,8 +150,9 @@ SceUID sceKernelCreateTlspl(const char *name, int part, int attr, unsigned int s
     }
 
     /* The links of the first two blocks are stored in the pool itself. */
-    links = NULL;
-    if ((s32)blocks >= 3) {
+    if ((s32)blocks < 3)
+        links = NULL;
+    else {
         links = sceKernelAllocHeapMemory(g_threadman.heapId, blocks * sizeof(*links));
         if (links == NULL) {
             sceKernelCpuResumeIntr(intr);
@@ -166,7 +172,7 @@ SceUID sceKernelCreateTlspl(const char *name, int part, int attr, unsigned int s
     }
     base = sceKernelGetBlockHeadAddr(blockId);
 
-    status = sceKernelCreateUID(g_threadman.tlsplType, name, (pspGetK1() >> 31) | attr, &uid);
+    status = sceKernelCreateUID(g_threadman.tlsplType, name, attr | (pspGetK1() >> 31), &uid);
     if (status != SCE_ERROR_OK) {
         if (links != NULL)
             sceKernelFreeHeapMemory(g_threadman.heapId, links);
@@ -176,8 +182,8 @@ SceUID sceKernelCreateTlspl(const char *name, int part, int attr, unsigned int s
         return status;
     }
 
-    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     tlspl = UID_CB_TO_DATA(uid, g_threadman.tlsplType, SceThreadmanTlspl);
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     /* Store the slot in the UID. */
     uid->uid = (uid->uid & ~0x78) | ((slot & 0xF) << 3);
     status = uid->uid;
@@ -205,6 +211,10 @@ SceUID sceKernelCreateTlspl(const char *name, int part, int attr, unsigned int s
     return status;
 }
 
+/*
+ * PARITY-Q040 (7bf37b3): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q049 (2c1c0aa): If/else statements instead of ternaries (the original branches, no movz/movn).
+ */
 /**
  * Delete a TLS pool. The threads waiting on it are released with SCE_ERROR_KERNEL_WAIT_DELETE.
  * The pool cannot be deleted while a block is allocated, except the block of the current thread.
@@ -234,8 +244,12 @@ int sceKernelDeleteTlspl(SceUID uid)
     intr = sceKernelCpuSuspendIntr();
 
     slot = THREADMAN_TLSPL_SLOT(uid);
-    if (g_threadman.tlsplUids[slot] != uid
-        || sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.tlsplType, &cb) != SCE_ERROR_OK) {
+    if (g_threadman.tlsplUids[slot] != uid) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_UNKNOWN_TLSPLID;
+    }
+    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.tlsplType, &cb) != SCE_ERROR_OK) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_UNKNOWN_TLSPLID;
@@ -249,10 +263,9 @@ int sceKernelDeleteTlspl(SceUID uid)
     tlspl = UID_CB_TO_DATA(cb, g_threadman.tlsplType, SceThreadmanTlspl);
     if (tlspl->numFreeBlocks < tlspl->numBlocks) {
         /* Only the block of the current thread can be in use. */
-        block = NULL;
         if (tlspl->numFreeBlocks == tlspl->numBlocks - 1) {
             thread = g_threadman.curThread;
-            block = thread->k0->tls[slot];
+            block = (void *)thread->k0->tls[slot];
             if (block != NULL) {
                 index = _sceKernelTlsplCheckBlock(tlspl, block);
                 if (index < 0) {
@@ -260,9 +273,11 @@ int sceKernelDeleteTlspl(SceUID uid)
                     pspSetK1(oldK1);
                     return index;
                 }
-                thread->k0->tls[slot] = NULL;
+                thread->k0->tls[slot] = 0;
                 sceKernelMemset32(block, 0, tlspl->blockSize);
             }
+        } else {
+            block = NULL;
         }
         if (block == NULL) {
             sceKernelCpuResumeIntr(intr);
@@ -280,6 +295,14 @@ int sceKernelDeleteTlspl(SceUID uid)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q065 (7d16e3b): Guard and arm shape taken from the original's layout (wait arm first, positive guards, addr
+ *     != NULL block).
+ * PARITY-Q168 (supersedes Q065's arm order): The lastFree != NULL (allocate) arm comes first and jumps to the end
+ *     with goto, so the wait arm falls through into the exit. The two arms end in the same tls/data/memset tail;
+ *     flow2 crossjumping keeps that tail in the fallthrough predecessor and makes the other arm jump into it. In
+ *     the original, the allocate arm jumps into the wait arm's tail, so the wait arm was the fallthrough.
+ */
 /**
  * Get the block of the current thread in a TLS pool, allocating it (and waiting until one is available)
  * if needed. A newly allocated block is zeroed.
@@ -344,7 +367,7 @@ int _sceKernelAllocateTlspl(SceUID uid, void **data, unsigned int *timeout)
 
     thread = g_threadman.curThread;
     /* The thread already has a block. */
-    block = thread->k0->tls[slot];
+    block = (void *)thread->k0->tls[slot];
     if (block != NULL) {
         if (!pspK1PtrOk(block)) {
             sceKernelCpuResumeIntr(intr);
@@ -366,27 +389,30 @@ int _sceKernelAllocateTlspl(SceUID uid, void **data, unsigned int *timeout)
 
     if (tlspl->lastFree != NULL) {
         index = _sceKernelTlsplAllocBlock(tlspl);
-        status = SCE_ERROR_OK;
         block = tlspl->base + tlspl->blockSize * index;
-    } else {
-        thread->waitWithCallbacks = 0;
-        status = sub_00000908(cb, SCE_THREADMAN_WAIT_TLSPL, waitQ->attr, &timeoutClock, (SceUInt *)timeout);
-        if (status != SCE_ERROR_OK) {
-            sceKernelCpuResumeIntr(intr);
-            pspSetK1(oldK1);
-            return status;
-        }
-        block = (void *)thread->waitData[0];
+        thread->k0->tls[slot] = (u32)block;
+        *data = block;
+        sceKernelMemset32(block, 0, tlspl->blockSize);
+        status = SCE_ERROR_OK;
+        goto end;
     }
-    thread->k0->tls[slot] = block;
-    *data = block;
-    sceKernelMemset32(block, 0, tlspl->blockSize);
-
+    thread->waitWithCallbacks = 0;
+    status = sub_00000908(cb, SCE_THREADMAN_WAIT_TLSPL, waitQ->attr, &timeoutClock, (SceUInt *)timeout);
+    if (status == SCE_ERROR_OK) {
+        block = (void *)thread->waitData[0];
+        thread->k0->tls[slot] = (u32)block;
+        *data = block;
+        sceKernelMemset32(block, 0, tlspl->blockSize);
+    }
+end:
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return status;
 }
 
+/*
+ * PARITY-Q040 (2f11646): Separate ifs for the early error checks: the original gives each check its own branch.
+ */
 /**
  * Free the block of the current thread in a TLS pool. The block is given to the first waiting thread, if
  * any.
@@ -394,6 +420,10 @@ int _sceKernelAllocateTlspl(SceUID uid, void **data, unsigned int *timeout)
  * @param uid The UID of the pool.
  *
  * @return 0 on success (also if the thread has no block), < 0 on error.
+ */
+/*
+ * PARITY-Q088: The first waiter is written through the list head directly instead of reusing `thread` (the current
+ *     thread then lives only up to the TLS slot clear, which gives the original's global allocation).
  */
 // Subroutine sceKernelFreeTlspl - Address 0x0000DEC8
 int sceKernelFreeTlspl(SceUID uid)
@@ -417,8 +447,12 @@ int sceKernelFreeTlspl(SceUID uid)
     intr = sceKernelCpuSuspendIntr();
 
     slot = THREADMAN_TLSPL_SLOT(uid);
-    if (g_threadman.tlsplUids[slot] != uid
-        || sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.tlsplType, &cb) != SCE_ERROR_OK) {
+    if (g_threadman.tlsplUids[slot] != uid) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_UNKNOWN_TLSPLID;
+    }
+    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.tlsplType, &cb) != SCE_ERROR_OK) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_UNKNOWN_TLSPLID;
@@ -430,7 +464,7 @@ int sceKernelFreeTlspl(SceUID uid)
     }
 
     thread = g_threadman.curThread;
-    block = thread->k0->tls[slot];
+    block = (void *)thread->k0->tls[slot];
     if (block == NULL) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
@@ -450,13 +484,12 @@ int sceKernelFreeTlspl(SceUID uid)
         pspSetK1(oldK1);
         return index;
     }
-    thread->k0->tls[slot] = NULL;
+    thread->k0->tls[slot] = 0;
     THREADMAN_LOG(SCE_THREADMAN_LOG_FREE_TLSPL, 2, uid, block);
 
     if (waitQ->numWaitThreads > 0) {
         /* Give the block to the first waiting thread. */
-        thread = (SceThreadmanThread *)waitQ->waitList.next;
-        thread->waitData[0] = (s32)block;
+        ((SceThreadmanThread *)waitQ->waitList.next)->waitData[0] = (s32)block;
         sub_00000B08(cb, SCE_ERROR_OK, 0, intr);
     } else {
         sceKernelMemset32(block, 0, tlspl->blockSize);
@@ -474,6 +507,21 @@ int sceKernelFreeTlspl(SceUID uid)
  *
  * @return 0.
  */
+/*
+ * PARITY-Q041 (77a8368): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ * PARITY-Q058 (dbcc276): The 'thread' variable reused for the woken waiter (the original reuses its register).
+ * PARITY-Q065 (77a8368): Guard and arm shape taken from the original's layout (wait arm first, positive guards, addr
+ *     != NULL block).
+ * PARITY-Q092: MATCHING FORM, not believed to be the original's literal source. The block is stored into the waiter's
+ *     waitData[0] through a `SceSysmemUidCB **` cast. The pointer-typed store gets its own alias set, so under
+ *     -fstrict-aliasing the scheduler may move the load of `cb` (the frame slot passed to sub_00000B08) ahead of it,
+ *     as the original does. The plain `(s32)block` store, a `void **` cast and every union member form keep the
+ *     load after the store. The whole module with -fno-strict-aliasing also matches here but is 6 up / 102 down.
+ *     USER-APPROVED TYPE-PUN EXCEPTION (01:04 PT 2026-10-27, confirmed 19:03 PT): kept as a matching form. Why: only
+ *     the pointer-typed store's own alias set lets sched2 place the `cb` load before the waitData[0] store as the original
+ *     does (sched without it, exact with it). See threadman-deviations.md "Approved exceptions".
+ */
 // Subroutine sub_0000E0D4 - Address 0x0000E0D4
 s32 _sceKernelReleaseThreadTls(SceThreadmanThread *thread)
 {
@@ -485,38 +533,41 @@ s32 _sceKernelReleaseThreadTls(SceThreadmanThread *thread)
     SceSysmemUidCB *cb;
     SceThreadmanTlspl *tlspl;
     SceThreadmanWaitQ *waitQ;
-    SceThreadmanThread *waitThread;
 
     if (thread->k0 == NULL)
         return SCE_ERROR_OK;
 
     intr = sceKernelCpuSuspendIntr();
     for (slot = 0; slot < SCE_THREADMAN_NUM_TLSPL; slot++) {
-        block = thread->k0->tls[slot];
-        thread->k0->tls[slot] = NULL;
+        block = (void *)thread->k0->tls[slot];
+        thread->k0->tls[slot] = 0;
         uid = g_threadman.tlsplUids[slot];
-        if (uid == 0 || THREADMAN_TLSPL_SLOT(uid) != slot || block == NULL)
-            continue;
-        if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.tlsplType, &cb) != SCE_ERROR_OK)
-            continue;
-        tlspl = UID_CB_TO_DATA(cb, g_threadman.tlsplType, SceThreadmanTlspl);
-        waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
-        index = _sceKernelTlsplCheckBlock(tlspl, block);
-        if (index < 0)
-            continue;
-        if (waitQ->numWaitThreads > 0) {
-            waitThread = (SceThreadmanThread *)waitQ->waitList.next;
-            waitThread->waitData[0] = (s32)block;
-            sub_00000B08(cb, SCE_ERROR_OK, 0, intr);
-        } else {
-            sceKernelMemset32(block, 0, tlspl->blockSize);
-            _sceKernelTlsplFreeBlock(tlspl, index);
+        if (uid != 0 && THREADMAN_TLSPL_SLOT(uid) == slot && block != NULL) {
+            if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.tlsplType, &cb) != SCE_ERROR_OK)
+                continue;
+            tlspl = UID_CB_TO_DATA(cb, g_threadman.tlsplType, SceThreadmanTlspl);
+            waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
+            index = _sceKernelTlsplCheckBlock(tlspl, block);
+            if (index < 0)
+                continue;
+            if (waitQ->numWaitThreads > 0) {
+                thread = (SceThreadmanThread *)waitQ->waitList.next;
+                *(SceSysmemUidCB **)&thread->waitData[0] = block;
+                sub_00000B08(cb, SCE_ERROR_OK, 0, intr);
+            } else {
+                sceKernelMemset32(block, 0, tlspl->blockSize);
+                _sceKernelTlsplFreeBlock(tlspl, index);
+            }
         }
     }
     sceKernelCpuResumeIntr(intr);
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q040 (2f11646): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q043 (b409123): Struct fields filled in struct order (the original's store order).
+ */
 /**
  * Get the status of a TLS pool.
  *
@@ -531,7 +582,6 @@ int sceKernelReferTlsplStatus(SceUID uid, SceKernelTlsplInfo *info)
     s32 oldK1;
     s32 intr;
     s32 slot;
-    u32 *ptr;
     SceSysmemUidCB *cb;
     SceThreadmanTlspl *tlspl;
     SceThreadmanWaitQ *waitQ;
@@ -546,8 +596,12 @@ int sceKernelReferTlsplStatus(SceUID uid, SceKernelTlsplInfo *info)
     intr = sceKernelCpuSuspendIntr();
 
     slot = THREADMAN_TLSPL_SLOT(uid);
-    if (g_threadman.tlsplUids[slot] != uid
-        || sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.tlsplType, &cb) != SCE_ERROR_OK) {
+    if (g_threadman.tlsplUids[slot] != uid) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_UNKNOWN_TLSPLID;
+    }
+    if (sceKernelGetUIDcontrolBlockWithType(uid, g_threadman.tlsplType, &cb) != SCE_ERROR_OK) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_UNKNOWN_TLSPLID;
@@ -563,18 +617,18 @@ int sceKernelReferTlsplStatus(SceUID uid, SceKernelTlsplInfo *info)
     tlspl = UID_CB_TO_DATA(cb, g_threadman.tlsplType, SceThreadmanTlspl);
     waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
     buf = &g_threadman.statusBuf.tlsplInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     if (cb->name != NULL)
         strncpy(buf->name, cb->name, SCE_UID_NAME_LEN);
-    buf->index = slot;
     buf->attr = waitQ->attr;
+    buf->index = slot;
     buf->blockSize = tlspl->size;
     buf->totalBlocks = tlspl->numBlocks;
     buf->freeBlocks = tlspl->numFreeBlocks;
     buf->numWaitThreads = waitQ->numWaitThreads;
-    memcpy(info, buf, (buf->size < info->size) ? buf->size : info->size);
+    THREADMAN_COPY_STATUS(info, &g_threadman.statusBuf.tlsplInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -606,13 +660,19 @@ static s32 _sceKernelTlsplCheckBlock(SceThreadmanTlspl *tlspl, void *data)
  *
  * @return The UID of the pool, or -1 if not found.
  */
+/*
+ * PARITY-Q048 (905162f, e0f7084): Value read once into a local (the original keeps it in one register).
+ */
 // Subroutine sub_0000E4A4 - Address 0x0000E4A4
 SceUID _sceKernelGetTlsplByBlockId(SceUID blockId)
 {
     SceSysmemUidCB *cb;
+    SceSysmemUidCB *type = g_threadman.tlsplType;
+    SceThreadmanTlspl *tlspl;
 
-    for (cb = g_threadman.tlsplType->PARENT0; cb != g_threadman.tlsplType; cb = cb->PARENT0) {
-        if (UID_CB_TO_DATA(cb, g_threadman.tlsplType, SceThreadmanTlspl)->blockId == blockId)
+    for (cb = type->PARENT0; cb != type; cb = cb->PARENT0) {
+        tlspl = UID_CB_TO_DATA(cb, type, SceThreadmanTlspl);
+        if (tlspl->blockId == blockId)
             return cb->uid;
     }
     return -1;

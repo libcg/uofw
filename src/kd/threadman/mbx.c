@@ -23,7 +23,7 @@
 /** The valid message box attributes. */
 #define SCE_THREADMAN_MBX_ATTR_MASK     (0x5FF)
 
-static s32 _sceKernelReceiveMbx(SceUID mbxid, void **pmessage, SceUInt *timeout, s32 withCallbacks);
+static s32 __attribute__((used)) _sceKernelReceiveMbx(SceUID mbxid, void **pmessage, SceUInt *timeout);
 static s32 _sceKernelMbxAddMessage(SceThreadmanMbx *mbx, SceThreadmanWaitQ *waitQ, SceKernelMsgPacket *message);
 static s32 _sceKernelMbxInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelMbxDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
@@ -35,6 +35,10 @@ SceSysmemUidLookupFunc g_MbxFuncs[] = {
     { 0, NULL }
 };
 
+/*
+ * PARITY-Q037 (cf293fa): UID attr | (k1 >> 31) passed to sceKernelCreateUID, as the original computes it.
+ * PARITY-Q051 (17a1ee9): Access through a local/named pointer (the original's addressing).
+ */
 /**
  * Create a message box.
  *
@@ -44,13 +48,22 @@ SceSysmemUidLookupFunc g_MbxFuncs[] = {
  *
  * @return The UID of the message box on success, < 0 on error.
  */
+/*
+ * PARITY-Q085: Creation failure returns through its own resume/return tail (success path dedented).
+ * PARITY-Q042: uid->uid read between the option and attr stores.
+ * PARITY-Q087: the new UID kept in its own `id` local instead of reusing the CreateUID status: the shorter status
+ *     lifetime gives the original's register assignment (name/status in s0, option in fp).
+ */
 // Subroutine sceKernelCreateMbx - Address 0x00008650
 SceUID sceKernelCreateMbx(const char *name, SceUInt attr, SceKernelMbxOptParam *option)
 {
     s32 oldK1;
     s32 intr;
     s32 status;
+    SceUID id;
     SceSysmemUidCB *uid;
+    SceThreadmanMbx *mbx;
+    SceThreadmanWaitQ *waitQ;
 
     oldK1 = pspShiftK1();
     if (!pspK1PtrOk(name) || !pspK1StaBufOk(option, 4)) {
@@ -68,17 +81,22 @@ SceUID sceKernelCreateMbx(const char *name, SceUInt attr, SceKernelMbxOptParam *
 
     intr = sceKernelCpuSuspendIntr();
 
-    status = sceKernelCreateUID(g_threadman.mbxType, name, (pspGetK1() >> 31) | attr, &uid);
-    if (status == SCE_ERROR_OK) {
-        UID_CB_TO_DATA(uid, g_threadman.mbxType, SceThreadmanMbx)->option = option;
-        UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ)->attr = attr;
-        status = uid->uid;
-        THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_MBX, 1, status);
+    status = sceKernelCreateUID(g_threadman.mbxType, name, attr | (pspGetK1() >> 31), &uid);
+    if (status != SCE_ERROR_OK) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return status;
     }
+    mbx = UID_CB_TO_DATA(uid, g_threadman.mbxType, SceThreadmanMbx);
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    mbx->option = option;
+    id = uid->uid;
+    waitQ->attr = attr;
+    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_MBX, 1, id);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
-    return status;
+    return id;
 }
 
 /**
@@ -122,6 +140,10 @@ int sceKernelDeleteMbx(SceUID mbxid)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q046 (93831a4): Object pointer derived before waitQ (the original loads the object's type word first).
+ * PARITY-Q047 (ce8a24a): Interrupt state read raw / at the original's position.
+ */
 /**
  * Send a message to a message box. If a thread is waiting on the message box, the message is directly
  * given to it, otherwise it is queued.
@@ -139,15 +161,16 @@ int sceKernelSendMbx(SceUID mbxid, void *message)
     s32 isIntr;
     s32 status;
     SceSysmemUidCB *uid;
+    SceThreadmanMbx *mbx;
     SceThreadmanWaitQ *waitQ;
     SceThreadmanThread *thread;
 
     oldK1 = pspShiftK1();
+    isIntr = pspCop0CtrlGet(COP0_CTRL_IS_INTERRUPT);
     if (!pspK1StaBufOk(message, sizeof(SceKernelMsgPacket))) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
     }
-    isIntr = THREADMAN_IS_INTR_CONTEXT();
 
     intr = sceKernelCpuSuspendIntr();
 
@@ -162,6 +185,7 @@ int sceKernelSendMbx(SceUID mbxid, void *message)
         return SCE_ERROR_KERNEL_ILLEGAL_PERMISSION;
     }
 
+    mbx = UID_CB_TO_DATA(uid, g_threadman.mbxType, SceThreadmanMbx);
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     THREADMAN_LOG(SCE_THREADMAN_LOG_SEND_MBX, 2, mbxid, message);
 
@@ -172,8 +196,7 @@ int sceKernelSendMbx(SceUID mbxid, void *message)
             *(void **)thread->waitData[0] = message;
         sub_00000B08(uid, SCE_ERROR_OK, isIntr, intr);
     } else {
-        status = _sceKernelMbxAddMessage(UID_CB_TO_DATA(uid, g_threadman.mbxType, SceThreadmanMbx), waitQ,
-            message);
+        status = _sceKernelMbxAddMessage(mbx, waitQ, message);
         if (status != SCE_ERROR_OK) {
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
@@ -196,10 +219,7 @@ int sceKernelSendMbx(SceUID mbxid, void *message)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelReceiveMbx - Address 0x00008A68
-int sceKernelReceiveMbx(SceUID mbxid, void **pmessage, SceUInt *timeout)
-{
-    return _sceKernelReceiveMbx(mbxid, pmessage, timeout, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelReceiveMbx, _sceKernelReceiveMbx, 0);
 
 /**
  * Receive a message from a message box, waiting until one is available and running the callbacks notified
@@ -212,14 +232,19 @@ int sceKernelReceiveMbx(SceUID mbxid, void **pmessage, SceUInt *timeout)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelReceiveMbxCB - Address 0x00008A70
-int sceKernelReceiveMbxCB(SceUID mbxid, void **pmessage, SceUInt *timeout)
-{
-    return _sceKernelReceiveMbx(mbxid, pmessage, timeout, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelReceiveMbxCB, _sceKernelReceiveMbx, 1);
 
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (455e483): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ * PARITY-Q065 (455e483): Guard and arm shape taken from the original's layout (wait arm first, positive guards, addr
+ *     != NULL block).
+ */
 // Subroutine sub_00008A78 - Address 0x00008A78
-static s32 _sceKernelReceiveMbx(SceUID mbxid, void **pmessage, SceUInt *timeout, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelReceiveMbx(SceUID mbxid, void **pmessage, SceUInt *timeout)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     s32 status;
@@ -283,36 +308,40 @@ static s32 _sceKernelReceiveMbx(SceUID mbxid, void **pmessage, SceUInt *timeout,
                 return SCE_ERROR_KERNEL_WAIT_DELETE;
             }
         }
-        if (mbx->numMessages > 0) {
-            /* Take the first message. */
-            last = mbx->lastMessage;
-            message = last->next;
-            if (message == NULL || !pspK1PtrOk(message) || message->next == NULL || !pspK1PtrOk(message->next)) {
-                status = SCE_ERROR_KERNEL_ILLEGAL_ADDR;
-                break;
-            }
-            if (message == message->next) {
-                if (mbx->numMessages != 1) {
-                    status = SCE_ERROR_KERNEL_MESSAGEBOX_DUPLICATE_MESSAGE;
-                    break;
-                }
-                mbx->lastMessage = NULL;
-            } else
-                last->next = message->next;
-            mbx->numMessages--;
-            THREADMAN_LOG(SCE_THREADMAN_LOG_MESSAGE, 2, "recvmsg = 0x%x", message);
-            *pmessage = message;
-            status = SCE_ERROR_OK;
-            break;
-        }
+        if (mbx->numMessages > 0)
+            goto receive;
         thread->waitData[0] = (s32)pmessage;
         thread->waitWithCallbacks = withCallbacks;
         status = sub_00000908(uid, SCE_THREADMAN_WAIT_MBX, waitQ->attr, &timeoutClock, timeout);
     } while (withCallbacks && status == (s32)SCE_ERROR_KERNEL_WAIT_STATUS_RELEASED_CALLBACK);
 
+end:
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return status;
+
+receive:
+
+    /* Take the first message. */
+    last = mbx->lastMessage;
+    message = last->next;
+    if (message == NULL || !pspK1PtrOk(message) || message->next == NULL || !pspK1PtrOk(message->next)) {
+        status = SCE_ERROR_KERNEL_ILLEGAL_ADDR;
+        goto end;
+    }
+    if (message == message->next) {
+        if (mbx->numMessages != 1) {
+            status = SCE_ERROR_KERNEL_MESSAGEBOX_DUPLICATE_MESSAGE;
+            goto end;
+        }
+        mbx->lastMessage = NULL;
+    } else
+        last->next = message->next;
+    mbx->numMessages--;
+    THREADMAN_LOG(SCE_THREADMAN_LOG_MESSAGE, 2, " recvmsg = 0x%x", message);
+    *pmessage = message;
+    status = SCE_ERROR_OK;
+    goto end;
 }
 
 /**
@@ -322,6 +351,11 @@ static s32 _sceKernelReceiveMbx(SceUID mbxid, void **pmessage, SceUInt *timeout,
  * @param pmessage Receives the address of the message.
  *
  * @return 0 on success, SCE_ERROR_KERNEL_MESSAGEBOX_NO_MESSAGE if the message box is empty, < 0 on error.
+ */
+/*
+ * PARITY-Q183: The message is taken inside `if (mbx->numMessages > 0)`, with the empty-box path after it. The
+ *     taking path then precedes the "nomsg" block in the instruction stream, and register renaming (which picks the
+ *     least recently used register, block by block in stream order) gives the original's registers.
  */
 // Subroutine sceKernelPollMbx - Address 0x00008DC0
 int sceKernelPollMbx(SceUID mbxid, void **pmessage)
@@ -355,37 +389,37 @@ int sceKernelPollMbx(SceUID mbxid, void **pmessage)
     mbx = UID_CB_TO_DATA(uid, g_threadman.mbxType, SceThreadmanMbx);
     THREADMAN_LOG(SCE_THREADMAN_LOG_POLL_MBX, 2, mbxid, pmessage);
 
-    if (mbx->numMessages <= 0) {
-        THREADMAN_LOG(SCE_THREADMAN_LOG_MESSAGE, 1, "sceKernelPollMbx nomsg");
-        sceKernelCpuResumeIntr(intr);
-        pspSetK1(oldK1);
-        return SCE_ERROR_KERNEL_MESSAGEBOX_NO_MESSAGE;
-    }
-
-    /* Take the first message. */
-    last = mbx->lastMessage;
-    message = last->next;
-    if (message == NULL || !pspK1PtrOk(message) || message->next == NULL || !pspK1PtrOk(message->next)) {
-        sceKernelCpuResumeIntr(intr);
-        pspSetK1(oldK1);
-        return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
-    }
-    if (message == message->next) {
-        if (mbx->numMessages != 1) {
+    if (mbx->numMessages > 0) { /* PARITY-Q183 */
+        /* Take the first message. */
+        last = mbx->lastMessage;
+        message = last->next;
+        if (message == NULL || !pspK1PtrOk(message) || message->next == NULL || !pspK1PtrOk(message->next)) {
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
-            return SCE_ERROR_KERNEL_MESSAGEBOX_DUPLICATE_MESSAGE;
+            return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
         }
-        mbx->lastMessage = NULL;
-    } else
-        last->next = message->next;
-    mbx->numMessages--;
-    THREADMAN_LOG(SCE_THREADMAN_LOG_MESSAGE, 2, "recvmsg = 0x%x", message);
-    *pmessage = message;
+        if (message == message->next) {
+            if (mbx->numMessages != 1) {
+                sceKernelCpuResumeIntr(intr);
+                pspSetK1(oldK1);
+                return SCE_ERROR_KERNEL_MESSAGEBOX_DUPLICATE_MESSAGE;
+            }
+            mbx->lastMessage = NULL;
+        } else
+            last->next = message->next;
+        mbx->numMessages--;
+        THREADMAN_LOG(SCE_THREADMAN_LOG_MESSAGE, 2, " recvmsg = 0x%x", message);
+        *pmessage = message;
 
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_OK;
+    }
+
+    THREADMAN_LOG(SCE_THREADMAN_LOG_MESSAGE, 1, "sceKernelPollMbx nomsg");
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
-    return SCE_ERROR_OK;
+    return SCE_ERROR_KERNEL_MESSAGEBOX_NO_MESSAGE;
 }
 
 /**
@@ -447,7 +481,6 @@ int sceKernelReferMbxStatus(SceUID mbxid, SceKernelMbxInfo *info)
 {
     s32 oldK1;
     s32 intr;
-    u32 *ptr;
     SceSysmemUidCB *uid;
     SceThreadmanMbx *mbx;
     SceThreadmanWaitQ *waitQ;
@@ -477,8 +510,8 @@ int sceKernelReferMbxStatus(SceUID mbxid, SceKernelMbxInfo *info)
     mbx = UID_CB_TO_DATA(uid, g_threadman.mbxType, SceThreadmanMbx);
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     buf = &g_threadman.statusBuf.mbxInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     if (uid->name != NULL)
         strncpy(buf->name, uid->name, SCE_UID_NAME_LEN);
@@ -487,7 +520,7 @@ int sceKernelReferMbxStatus(SceUID mbxid, SceKernelMbxInfo *info)
     buf->numMessages = mbx->numMessages;
     if (mbx->lastMessage != NULL)
         buf->firstMessage = mbx->lastMessage->next;
-    memcpy(info, buf, (buf->size < info->size) ? buf->size : info->size);
+    THREADMAN_COPY_STATUS(info, &g_threadman.statusBuf.mbxInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -510,6 +543,11 @@ s32 _sceKernelMbxInit(void)
  * Queue a message: at the end of the list (SCE_KERNEL_MBA_MSFIFO), or after the messages with a lower or
  * equal priority (SCE_KERNEL_MBA_MSPRI).
  */
+/*
+ * PARITY-Q054 (96277f9): Comparison operand order as the original's branch operands.
+ * PARITY-Q081 (b232876): Priority scan written as a label/goto loop, not for (;;) (the original's block layout,
+ *     no loop pass rotation).
+ */
 // Subroutine sub_00009338 - Address 0x00009338
 static s32 _sceKernelMbxAddMessage(SceThreadmanMbx *mbx, SceThreadmanWaitQ *waitQ, SceKernelMsgPacket *message)
 {
@@ -517,11 +555,11 @@ static s32 _sceKernelMbxAddMessage(SceThreadmanMbx *mbx, SceThreadmanWaitQ *wait
     SceKernelMsgPacket *prev;
     SceKernelMsgPacket *cur;
 
-    last = mbx->lastMessage;
-    if (last == NULL) {
+    if (mbx->lastMessage == NULL) {
         mbx->lastMessage = message;
         message->next = message;
     } else {
+        last = mbx->lastMessage;
         if (last == message)
             return SCE_ERROR_KERNEL_MESSAGEBOX_DUPLICATE_MESSAGE;
         if ((waitQ->attr & SCE_KERNEL_MBA_MSPRI) == 0) {
@@ -535,21 +573,19 @@ static s32 _sceKernelMbxAddMessage(SceThreadmanMbx *mbx, SceThreadmanWaitQ *wait
             mbx->lastMessage = message;
         } else {
             prev = last;
-            for (;;) {
-                cur = prev->next;
-                if (cur == message)
-                    return SCE_ERROR_KERNEL_MESSAGEBOX_DUPLICATE_MESSAGE;
-                if (cur == NULL || !pspK1PtrOk(cur))
-                    return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
-                if (message->msgPriority < cur->msgPriority)
-                    break;
+next:
+            cur = prev->next;
+            if (cur == message)
+                return SCE_ERROR_KERNEL_MESSAGEBOX_DUPLICATE_MESSAGE;
+            if (cur == NULL || !pspK1PtrOk(cur))
+                return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
+            if (cur->msgPriority <= message->msgPriority) {
                 prev = cur;
-                if (cur == last) {
-                    /* The new message has the highest priority value: it becomes the last one. */
-                    mbx->lastMessage = message;
-                    cur = cur->next;
-                    break;
-                }
+                if (cur != last)
+                    goto next;
+                /* The new message has the highest priority value: it becomes the last one. */
+                mbx->lastMessage = message;
+                cur = cur->next;
             }
             if (!pspK1PtrOk(cur))
                 return SCE_ERROR_KERNEL_ILLEGAL_ADDR;

@@ -24,14 +24,8 @@ sub_00000000:
     lui         $t3, 0x1
     ori         $t3, $t3, 0x100
     lui         $t4, %hi(ExcepManCB)
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
+    # The sleep loop is aligned on a data cache line (64 bytes).
+    .p2align 6
 .L00040:
     lw          $t6, %lo(ExcepManCB)($t4)
     mtc0        $v0, $25
@@ -47,8 +41,7 @@ sub_00000000:
     mtic $zero, $0
     j           .L00040
     nop
-    nop
-    nop
+    .p2align 6
 
 # Subroutine sub_00000080 - Address 0x00000080
 # Save the VFPU registers into a VFPU context (a0, SceThreadmanVfpuContext): the 128 vector registers
@@ -227,8 +220,7 @@ sub_000002C8:
 
 # Part of the exception handler below (reached from sub_000004B8): decrement the counter at v1 + 8 and,
 # when it reaches 0, store the word at v1 + 4 to the address at v1 + 0.
-    nop
-    nop
+    .p2align 6
 .L00300:
     lw          $v0, 0x8($v1)
     beqz        $v0, .L004CC
@@ -480,39 +472,4 @@ sub_000005A4:
     mtc0        $v0, $12
     jr          $ra
     ctc0        $zero, $8
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-
-# Subroutine sub_000172C8 - Address 0x000172C8
-# The entry of the idle thread when the CPU profiler is enabled: put the CPU to sleep forever, writing back
-# a data cache line before each sleep.
-    .globl sub_000172C8
-sub_000172C8:
-    mfc0        $v0, $25
-.L172CC:
-    cache       0x0A, 0x0($v0)
-    .word 0x70000000  # sleep
-    j           .L172CC
-    nop
-
-# Subroutine sub_000172DC - Address 0x000172DC
-# The return address of the entry of the kernel mode threads (see sub_00013E80()): exit the thread with
-# the result of its entry, in $v0 on entry. This cannot be written in C as $v0 is read on entry.
-    .globl sub_000172DC
-sub_000172DC:
-    addiu $sp, $sp, -16
-    sw    $ra, 0($sp)
-    jal   sceKernelExitThread
-    addu  $a0, $v0, $zero
-    lw    $ra, 0($sp)
-    jr    $ra
-    addiu $sp, $sp, 16
+    .p2align 6

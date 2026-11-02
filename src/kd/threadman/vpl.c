@@ -22,7 +22,7 @@
 /** The valid variable-length memory pool attributes. */
 #define SCE_THREADMAN_VPL_ATTR_MASK     (0x43FF)
 
-static s32 _sceKernelAllocateVpl(SceUID uid, SceSize size, void **data, unsigned int *timeout, s32 withCallbacks);
+static s32 __attribute__((used)) _sceKernelAllocateVpl(SceUID uid, SceSize size, void **data, unsigned int *timeout);
 static s32 _sceKernelVplInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelVplDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelVplWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
@@ -35,6 +35,11 @@ SceSysmemUidLookupFunc g_VplFuncs[] = {
     { 0, NULL }
 };
 
+/*
+ * PARITY-Q037 (cf293fa): UID attr | (k1 >> 31) passed to sceKernelCreateUID, as the original computes it.
+ * PARITY-Q045 (58379bc): The new UID kept in a local id read before the data pointer (the original's register use).
+ * PARITY-Q083: sceKernelCreateUID failure as `goto error` (goto prediction: the original's block order).
+ */
 /**
  * Create a variable-length memory pool.
  *
@@ -52,6 +57,7 @@ SceUID sceKernelCreateVpl(const char *name, int part, int attr, unsigned int siz
     s32 oldK1;
     s32 intr;
     s32 status;
+    SceUID id;
     SceUID heapId;
     SceSysmemUidCB *uid;
     SceSysmemUidCB *heapUid;
@@ -93,21 +99,17 @@ SceUID sceKernelCreateVpl(const char *name, int part, int attr, unsigned int siz
         return SCE_ERROR_KERNEL_ILLEGAL_PERMISSION;
     }
 
-    status = sceKernelCreateUID(g_threadman.vplType, name, (pspGetK1() >> 31) | attr, &uid);
-    if (status != SCE_ERROR_OK) {
-        sceKernelCpuResumeIntr(intr);
-        pspSetK1(oldK1);
-        return status;
-    }
-
+    status = sceKernelCreateUID(g_threadman.vplType, name, attr | (pspGetK1() >> 31), &uid);
+    if (status != SCE_ERROR_OK)
+        goto error;
     vpl = UID_CB_TO_DATA(uid, g_threadman.vplType, SceThreadmanVpl);
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
-    status = uid->uid;
+    id = uid->uid;
     /* SCE_KERNEL_VPA_HIGHMEM: allocate the heap from the top of the partition. */
-    heapId = sceKernelCreateHeap(part, size, (attr >> 13) & 2, name);
+    heapId = sceKernelCreateHeap(part, size, ((u32)attr >> 13) & 2, name);
     vpl->heapId = heapId;
     if (heapId <= 0) {
-        sceKernelDeleteUID(status);
+        sceKernelDeleteUID(id);
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_NO_MEMORY;
@@ -115,13 +117,18 @@ SceUID sceKernelCreateVpl(const char *name, int part, int attr, unsigned int siz
     vpl->poolSize = sceKernelHeapTotalFreeSize(heapId);
     vpl->option = opt;
     waitQ->attr = attr;
-    if ((((pspGetK1() >> 31) | attr) & 1) != 0) {
+    if (((attr | (pspGetK1() >> 31)) & 1) != 0) {
         /* Let the heap be accessed from user mode too. */
         if (sceKernelGetUIDcontrolBlock(vpl->heapId, &heapUid) == SCE_ERROR_OK)
             heapUid->attr |= 1;
     }
-    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_VPL, 1, status);
+    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_VPL, 1, id);
 
+    sceKernelCpuResumeIntr(intr);
+    pspSetK1(oldK1);
+    return id;
+
+error:
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return status;
@@ -180,10 +187,7 @@ int sceKernelDeleteVpl(SceUID uid)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelAllocateVpl - Address 0x0000B7D4
-int sceKernelAllocateVpl(SceUID uid, unsigned int size, void **data, unsigned int *timeout)
-{
-    return _sceKernelAllocateVpl(uid, size, data, timeout, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelAllocateVpl, _sceKernelAllocateVpl, 0);
 
 /**
  * Allocate a block from a variable-length memory pool, waiting until it is available and running the
@@ -197,18 +201,21 @@ int sceKernelAllocateVpl(SceUID uid, unsigned int size, void **data, unsigned in
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelAllocateVplCB - Address 0x0000B7DC
-int sceKernelAllocateVplCB(SceUID uid, unsigned int size, void **data, unsigned int *timeout)
-{
-    return _sceKernelAllocateVpl(uid, size, data, timeout, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelAllocateVplCB, _sceKernelAllocateVpl, 1);
 
 /*
  * Common part of sceKernelAllocateVpl() and sceKernelAllocateVplCB().
  * Note: the original passes withCallbacks in $t3.
  */
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (e093285): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ */
 // Subroutine sub_0000B7E4 - Address 0x0000B7E4
-static s32 _sceKernelAllocateVpl(SceUID uid, SceSize size, void **data, unsigned int *timeout, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelAllocateVpl(SceUID uid, SceSize size, void **data, unsigned int *timeout)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     s32 status;
@@ -358,6 +365,13 @@ int sceKernelTryAllocateVpl(SceUID uid, unsigned int size, void **data)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q046 (3b08adb): Object pointer derived before waitQ (the original loads the object's type word first).
+ * PARITY-Q050 (3b08adb): Loop shape (guarded block instead of continue / separate next cursor / head pointer walk) as
+ *     the original's layout.
+ * PARITY-Q065 (3b08adb): Guard and arm shape taken from the original's layout (wait arm first, positive guards, addr
+ *     != NULL block).
+ */
 /**
  * Free a block of a variable-length memory pool, and give the memory to the waiting threads.
  *
@@ -404,8 +418,8 @@ int sceKernelFreeVpl(SceUID uid, void *data)
         return SCE_ERROR_KERNEL_ILLEGAL_PERMISSION;
     }
 
-    waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
     vpl = UID_CB_TO_DATA(cb, g_threadman.vplType, SceThreadmanVpl);
+    waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
     if (data == NULL || sceKernelFreeHeapMemory(vpl->heapId, data) < 0) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
@@ -415,14 +429,20 @@ int sceKernelFreeVpl(SceUID uid, void *data)
 
     /* Satisfy the waiting threads in order (skipping the ones which cannot be with SCE_KERNEL_VPA_PASS). */
     numWokenUp = 0;
-    for (thread = (SceThreadmanThread *)waitQ->waitList.next; thread != (SceThreadmanThread *)&waitQ->waitList;
-         thread = next) {
+    next = (SceThreadmanThread *)waitQ->waitList.next;
+    while (next != (SceThreadmanThread *)&waitQ->waitList) {
+        thread = next;
         next = (SceThreadmanThread *)thread->link.next;
         addr = sceKernelAllocHeapMemory(vpl->heapId, thread->waitData[1]);
+        /*
+         * PARITY-Q203 (source form): the failed allocation is handled first
+         * (break, or continue with SCE_KERNEL_VPA_PASS); the changed block
+         * frequencies give the original's register allocation.
+         */
         if (addr == NULL) {
-            if (waitQ->attr & SCE_KERNEL_VPA_PASS)
-                continue;
-            break;
+            if (!(waitQ->attr & SCE_KERNEL_VPA_PASS))
+                break;
+            continue;
         }
         thread->waitData[0] = (s32)addr;
         if (sub_00000924(thread) > 0) {
@@ -503,7 +523,6 @@ int sceKernelReferVplStatus(SceUID uid, SceKernelVplInfo *info)
 {
     s32 oldK1;
     s32 intr;
-    u32 *ptr;
     SceSysmemUidCB *cb;
     SceThreadmanVpl *vpl;
     SceThreadmanWaitQ *waitQ;
@@ -533,8 +552,8 @@ int sceKernelReferVplStatus(SceUID uid, SceKernelVplInfo *info)
     vpl = UID_CB_TO_DATA(cb, g_threadman.vplType, SceThreadmanVpl);
     waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
     buf = &g_threadman.statusBuf.vplInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     if (cb->name != NULL)
         strncpy(buf->name, cb->name, SCE_UID_NAME_LEN);
@@ -542,7 +561,7 @@ int sceKernelReferVplStatus(SceUID uid, SceKernelVplInfo *info)
     buf->poolSize = vpl->poolSize;
     buf->freeSize = sceKernelHeapTotalFreeSize(vpl->heapId);
     buf->numWaitThreads = waitQ->numWaitThreads;
-    memcpy(info, buf, (buf->size < info->size) ? buf->size : info->size);
+    THREADMAN_COPY_STATUS(info, &g_threadman.statusBuf.vplInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -554,13 +573,19 @@ int sceKernelReferVplStatus(SceUID uid, SceKernelVplInfo *info)
  *
  * @return The UID of the pool, or -1 if not found.
  */
+/*
+ * PARITY-Q048 (905162f, e0f7084): Value read once into a local (the original keeps it in one register).
+ */
 // Subroutine sub_0000C1FC - Address 0x0000C1FC
 SceUID _sceKernelGetVplByHeapId(SceUID heapId)
 {
     SceSysmemUidCB *cb;
+    SceSysmemUidCB *type = g_threadman.vplType;
+    SceThreadmanVpl *vpl;
 
-    for (cb = g_threadman.vplType->PARENT0; cb != g_threadman.vplType; cb = cb->PARENT0) {
-        if (UID_CB_TO_DATA(cb, g_threadman.vplType, SceThreadmanVpl)->heapId == heapId)
+    for (cb = type->PARENT0; cb != type; cb = cb->PARENT0) {
+        vpl = UID_CB_TO_DATA(cb, type, SceThreadmanVpl);
+        if (vpl->heapId == heapId)
             return cb->uid;
     }
     return -1;
@@ -601,6 +626,12 @@ static s32 _sceKernelVplDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc,
  * Give the free memory to the waiting threads (called by the WaitQ code, for example after a waiting thread
  * was released). Returns the number of threads to reschedule.
  */
+/*
+ * PARITY-Q050 (4e5b0b9, bef87e6): Loop shape (guarded block instead of continue / separate next cursor / head pointer
+ *     walk) as the original's layout.
+ * PARITY-Q065 (bef87e6): Guard and arm shape taken from the original's layout (wait arm first, positive guards, addr
+ *     != NULL block).
+ */
 // Subroutine sub_0000C32C - Address 0x0000C32C
 static s32 _sceKernelVplWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc __attribute__((unused)),
     s32 funcId __attribute__((unused)), va_list ap __attribute__((unused)))
@@ -618,18 +649,17 @@ static s32 _sceKernelVplWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uidWi
     if (waitQ->numWaitThreads <= 0)
         return 0;
 
-    for (thread = (SceThreadmanThread *)waitQ->waitList.next; thread != (SceThreadmanThread *)&waitQ->waitList;
-         thread = next) {
+    next = (SceThreadmanThread *)waitQ->waitList.next;
+    while (next != (SceThreadmanThread *)&waitQ->waitList) {
+        thread = next;
         next = (SceThreadmanThread *)thread->link.next;
         addr = sceKernelAllocHeapMemory(vpl->heapId, thread->waitData[1]);
-        if (addr == NULL) {
-            if (waitQ->attr & SCE_KERNEL_VPA_PASS)
-                continue;
+        if (addr != NULL) {
+            thread->waitData[0] = (s32)addr;
+            if (sub_00000924(thread) > 0)
+                numWokenUp++;
+        } else if (!(waitQ->attr & SCE_KERNEL_VPA_PASS))
             break;
-        }
-        thread->waitData[0] = (s32)addr;
-        if (sub_00000924(thread) > 0)
-            numWokenUp++;
     }
     return numWokenUp;
 }

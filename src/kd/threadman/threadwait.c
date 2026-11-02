@@ -16,9 +16,9 @@
 
 #include "threadman_int.h"
 
-static s32 _sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout, s32 withCallbacks);
-static s32 _sceKernelDelayThread(SceUInt delay, s32 withCallbacks);
-static s32 _sceKernelDelaySysClockThread(SceKernelSysClock *delay, s32 withCallbacks);
+static s32 __attribute__((used)) _sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout);
+static s32 __attribute__((used)) _sceKernelDelayThread(SceUInt delay);
+static s32 __attribute__((used)) _sceKernelDelaySysClockThread(SceKernelSysClock *delay);
 static void _sceKernelDelayThreadTimeout(void *common);
 
 /**
@@ -179,6 +179,9 @@ int sceKernelWakeupThread(SceUID thid)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q047 (09d9be8): Interrupt state read raw / at the original's position.
+ */
 /**
  * Cancel the pending wakeups of a thread.
  *
@@ -191,13 +194,15 @@ int sceKernelCancelWakeupThread(SceUID thid)
 {
     s32 oldK1;
     s32 intr;
+    s32 isIntr;
     s32 count;
     SceSysmemUidCB *uid;
     SceThreadmanThread *thread;
 
     oldK1 = pspShiftK1();
+    isIntr = pspCop0CtrlGet(COP0_CTRL_IS_INTERRUPT);
     if (thid == 0) {
-        if (THREADMAN_IS_INTR_CONTEXT()) {
+        if (isIntr) {
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_ILLEGAL_THREAD;
         }
@@ -309,6 +314,11 @@ s32 sceKernelDonateWakeupThread(SceUID thid)
     return curThread->waitStatus;
 }
 
+/*
+ * PARITY-Q048: Value read once into a local (the original keeps it in one register).
+ * PARITY-Q064 (a8737ef): Switch result kept in its own variable / lookup result and owner type in one variable (the
+ *     original's register use).
+ */
 /**
  * Suspend a thread.
  *
@@ -322,6 +332,7 @@ int sceKernelSuspendThread(SceUID thid)
     s32 oldK1;
     s32 intr;
     s32 status;
+    s32 ret;
     s32 isIntr;
     SceSysmemUidCB *uid;
     SceThreadmanThread *thread;
@@ -362,7 +373,7 @@ int sceKernelSuspendThread(SceUID thid)
         if (g_threadman.dispatchSuspended != 0) {
             if (g_threadman.dispatchSuspended != 3)
                 g_threadman.dispatchSuspended = 2;
-            status = SCE_ERROR_OK;
+            ret = SCE_ERROR_OK;
             break;
         }
         /* Fall through. */
@@ -373,26 +384,33 @@ int sceKernelSuspendThread(SceUID thid)
             sub_00016BF4(thread, thread->currentPriority);
         threadmanListAddTail(&g_threadman.suspendedThreads, &thread->link);
         thread->status = SCE_THREADMAN_STATUS_SUSPEND;
-        status = SCE_ERROR_OK;
+        ret = SCE_ERROR_OK;
         break;
     case SCE_THREADMAN_STATUS_WAIT:
         thread->status = SCE_THREADMAN_STATUS_WAIT_SUSPEND;
-        status = SCE_ERROR_OK;
+        ret = SCE_ERROR_OK;
         break;
     case SCE_THREADMAN_STATUS_SUSPEND:
     case SCE_THREADMAN_STATUS_WAIT_SUSPEND:
-        status = SCE_ERROR_KERNEL_THREAD_ALREADY_SUSPEND;
+        ret = SCE_ERROR_KERNEL_THREAD_ALREADY_SUSPEND;
         break;
+    case SCE_THREADMAN_STATUS_DORMANT:
+    case SCE_THREADMAN_STATUS_DEAD:
     default:
-        status = SCE_ERROR_KERNEL_THREAD_ALREADY_DORMANT;
+        ret = SCE_ERROR_KERNEL_THREAD_ALREADY_DORMANT;
         break;
     }
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
-    return status;
+    return ret;
 }
 
+/*
+ * PARITY-Q048: Value read once into a local (the original keeps it in one register).
+ * PARITY-Q064 (d3844c2): Switch result kept in its own variable / lookup result and owner type in one variable (the
+ *     original's register use).
+ */
 /**
  * Resume a thread suspended by sceKernelSuspendThread().
  *
@@ -406,6 +424,7 @@ int sceKernelResumeThread(SceUID thid)
     s32 oldK1;
     s32 intr;
     s32 status;
+    s32 ret;
     s32 isIntr;
     SceSysmemUidCB *uid;
     SceThreadmanThread *thread;
@@ -441,38 +460,46 @@ int sceKernelResumeThread(SceUID thid)
     THREADMAN_LOG(SCE_THREADMAN_LOG_RESUME_THREAD, 1, thid);
 
     switch (thread->status) {
+    case SCE_THREADMAN_STATUS_SUSPEND:
+        threadmanListRemove(&thread->link);
+        thread->status = SCE_THREADMAN_STATUS_READY;
+        if (!isIntr)
+            sub_00016C48(thread, intr);
+        else {
+            sub_000127D0(thread);
+            g_threadman.nextThread = NULL;
+        }
+        ret = SCE_ERROR_OK;
+        break;
+    case SCE_THREADMAN_STATUS_WAIT_SUSPEND:
+        thread->status = SCE_THREADMAN_STATUS_WAIT;
+        ret = SCE_ERROR_OK;
+        break;
     case SCE_THREADMAN_STATUS_RUNNING:
         /* The interrupted thread, whose suspension is pending (see sceKernelSuspendThread()). */
         if (g_threadman.dispatchSuspended == 2) {
             g_threadman.dispatchSuspended = 1;
-            status = SCE_ERROR_OK;
-        } else
-            status = SCE_ERROR_KERNEL_THREAD_IS_NOT_SUSPEND;
-        break;
-    case SCE_THREADMAN_STATUS_SUSPEND:
-        threadmanListRemove(&thread->link);
-        thread->status = SCE_THREADMAN_STATUS_READY;
-        if (isIntr) {
-            sub_000127D0(thread);
-            g_threadman.nextThread = NULL;
-        } else
-            sub_00016C48(thread, intr);
-        status = SCE_ERROR_OK;
-        break;
-    case SCE_THREADMAN_STATUS_WAIT_SUSPEND:
-        thread->status = SCE_THREADMAN_STATUS_WAIT;
-        status = SCE_ERROR_OK;
-        break;
+            ret = SCE_ERROR_OK;
+            break;
+        }
+        /* FALLTHROUGH */
+    case SCE_THREADMAN_STATUS_READY:
+    case SCE_THREADMAN_STATUS_WAIT:
+    case SCE_THREADMAN_STATUS_DORMANT:
+    case SCE_THREADMAN_STATUS_DEAD:
     default:
-        status = SCE_ERROR_KERNEL_THREAD_IS_NOT_SUSPEND;
+        ret = SCE_ERROR_KERNEL_THREAD_IS_NOT_SUSPEND;
         break;
     }
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
-    return status;
+    return ret;
 }
 
+/*
+ * PARITY-Q051: Access through a local/named pointer (the original's addressing): the thread UID type read once.
+ */
 /**
  * Suspend all the user mode threads, and skip them when waking up waiting threads from now on.
  *
@@ -484,6 +511,7 @@ int sceKernelSuspendAllUserThreads(void)
     s32 oldK1;
     s32 intr;
     SceSysmemUidCB *uid;
+    SceSysmemUidCB *uidType;
     SceThreadmanThread *thread;
 
     oldK1 = pspShiftK1();
@@ -495,8 +523,9 @@ int sceKernelSuspendAllUserThreads(void)
     intr = sceKernelCpuSuspendIntr();
 
     /* Go through all the thread objects (the instances of the "Thread" UID type). */
-    for (uid = g_threadman.threadType->PARENT0; uid != g_threadman.threadType; uid = uid->PARENT0) {
-        thread = UID_CB_TO_DATA(uid, g_threadman.threadType, SceThreadmanThread);
+    uidType = g_threadman.threadType;
+    for (uid = uidType->PARENT0; uid != uidType; uid = uid->PARENT0) {
+        thread = UID_CB_TO_DATA(uid, uidType, SceThreadmanThread);
         if (!THREADMAN_IS_USER_THREAD(thread) && !(thread->attr & SCE_THREADMAN_THREAD_ATTR_UNK_08000000))
             continue;
 
@@ -509,6 +538,11 @@ int sceKernelSuspendAllUserThreads(void)
         case SCE_THREADMAN_STATUS_WAIT:
             thread->status = SCE_THREADMAN_STATUS_WAIT_SUSPEND;
             break;
+        case SCE_THREADMAN_STATUS_RUNNING:
+        case SCE_THREADMAN_STATUS_SUSPEND:
+        case SCE_THREADMAN_STATUS_WAIT_SUSPEND:
+        case SCE_THREADMAN_STATUS_DORMANT:
+        case SCE_THREADMAN_STATUS_DEAD:
         default:
             break;
         }
@@ -529,10 +563,7 @@ int sceKernelSuspendAllUserThreads(void)
  * @return The exit status of the thread on success, < 0 on error.
  */
 // Subroutine sceKernelWaitThreadEnd - Address 0x00003AC0
-int sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout)
-{
-    return _sceKernelWaitThreadEnd(thid, timeout, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelWaitThreadEnd, _sceKernelWaitThreadEnd, 0);
 
 /**
  * Wait until a thread ends, running the notified callbacks. See sceKernelWaitThreadEnd().
@@ -543,14 +574,17 @@ int sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout)
  * @return The exit status of the thread on success, < 0 on error.
  */
 // Subroutine sceKernelWaitThreadEndCB - Address 0x00003AC8
-int sceKernelWaitThreadEndCB(SceUID thid, SceUInt *timeout)
-{
-    return _sceKernelWaitThreadEnd(thid, timeout, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelWaitThreadEndCB, _sceKernelWaitThreadEnd, 1);
 
+/*
+ * PARITY-Q054 (d07dd48): Comparison operand order as the original's branch operands.
+ * PARITY-Q066 (d07dd48): The target compared with g_threadman.curThread directly (curThread only loaded before the
+ *     loop, as the original).
+ */
 // Subroutine sub_00003AD0 - Address 0x00003AD0
-static s32 _sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     s32 status;
@@ -587,7 +621,6 @@ static s32 _sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout, s32 withCallba
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_NOT_FOUND_THREAD;
     }
-    curThread = g_threadman.curThread;
     if (!THREADMAN_UID_PERM_OK(uid, SCE_THREADMAN_UID_ATTR_WAIT)) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
@@ -595,7 +628,7 @@ static s32 _sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout, s32 withCallba
     }
 
     thread = UID_CB_TO_DATA(uid, g_threadman.threadType, SceThreadmanThread);
-    if (thread == curThread) {
+    if (thread == g_threadman.curThread) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_THREAD;
@@ -642,10 +675,7 @@ static s32 _sceKernelWaitThreadEnd(SceUID thid, SceUInt *timeout, s32 withCallba
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelDelayThread - Address 0x00003D78
-int sceKernelDelayThread(SceUInt delay)
-{
-    return _sceKernelDelayThread(delay, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelDelayThread, _sceKernelDelayThread, 0);
 
 /**
  * Delay the current thread, running the notified callbacks.
@@ -655,14 +685,15 @@ int sceKernelDelayThread(SceUInt delay)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelDelayThreadCB - Address 0x00003D80
-int sceKernelDelayThreadCB(SceUInt delay)
-{
-    return _sceKernelDelayThread(delay, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelDelayThreadCB, _sceKernelDelayThread, 1);
 
+/*
+ * PARITY-Q042 (96e1ce5): Statement/store order taken from the original's store order.
+ */
 // Subroutine sub_00003D88 - Address 0x00003D88
-static s32 _sceKernelDelayThread(SceUInt delay, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelDelayThread(SceUInt delay)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     SceUID alarmId;
@@ -699,9 +730,11 @@ static s32 _sceKernelDelayThread(SceUInt delay, s32 withCallbacks)
         alarmId = sub_00010FAC(&endClock, _sceKernelDelayThreadTimeout, thread);
         if (alarmId < 0) {
             /* SCE_ERROR_KERNEL_WAIT_TIMEOUT: the delay has already elapsed. */
+            if (alarmId == (s32)SCE_ERROR_KERNEL_WAIT_TIMEOUT)
+                alarmId = SCE_ERROR_OK;
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
-            return (alarmId == (s32)SCE_ERROR_KERNEL_WAIT_TIMEOUT) ? SCE_ERROR_OK : alarmId;
+            return alarmId;
         }
         if (withCallbacks && thread->callbackNotified != 0) {
             /* A callback has been notified meanwhile: cancel the delay to run it first. */
@@ -732,10 +765,7 @@ static s32 _sceKernelDelayThread(SceUInt delay, s32 withCallbacks)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelDelaySysClockThread - Address 0x00003F9C
-int sceKernelDelaySysClockThread(SceKernelSysClock *delay)
-{
-    return _sceKernelDelaySysClockThread(delay, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelDelaySysClockThread, _sceKernelDelaySysClockThread, 0);
 
 /**
  * Delay the current thread, running the notified callbacks.
@@ -745,14 +775,15 @@ int sceKernelDelaySysClockThread(SceKernelSysClock *delay)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine sceKernelDelaySysClockThreadCB - Address 0x00003FA4
-int sceKernelDelaySysClockThreadCB(SceKernelSysClock *delay)
-{
-    return _sceKernelDelaySysClockThread(delay, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelDelaySysClockThreadCB, _sceKernelDelaySysClockThread, 1);
 
+/*
+ * PARITY-Q042 (96e1ce5): Statement/store order taken from the original's store order.
+ */
 // Subroutine sub_00003FAC - Address 0x00003FAC
-static s32 _sceKernelDelaySysClockThread(SceKernelSysClock *delay, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelDelaySysClockThread(SceKernelSysClock *delay)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     SceUID alarmId;
@@ -792,9 +823,11 @@ static s32 _sceKernelDelaySysClockThread(SceKernelSysClock *delay, s32 withCallb
         thread->timeout = NULL;
         alarmId = sub_00010FAC(&endClock, _sceKernelDelayThreadTimeout, thread);
         if (alarmId < 0) {
+            if (alarmId == (s32)SCE_ERROR_KERNEL_WAIT_TIMEOUT)
+                alarmId = SCE_ERROR_OK;
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
-            return (alarmId == (s32)SCE_ERROR_KERNEL_WAIT_TIMEOUT) ? SCE_ERROR_OK : alarmId;
+            return alarmId;
         }
         if (withCallbacks && thread->callbackNotified != 0) {
             sub_00011104(alarmId, NULL);

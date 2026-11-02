@@ -32,8 +32,7 @@
 #define THREADMAN_EVENT_FLAG_FROM_OWNER_LINK(entry) \
     ((SceThreadmanEventFlag *)((u8 *)(entry) - __builtin_offsetof(SceThreadmanEventFlag, ownerLink)))
 
-static s32 _sceKernelWaitEventFlag(SceUID evid, u32 bits, u32 wait, u32 *outBits, SceUInt *timeout,
-    s32 withCallbacks);
+static s32 __attribute__((used)) _sceKernelWaitEventFlag(SceUID evid, u32 bits, u32 wait, u32 *outBits, SceUInt *timeout);
 static s32 _sceKernelEventFlagEndWait(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelEventFlagInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelEventFlagDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
@@ -50,6 +49,12 @@ SceSysmemUidLookupFunc g_EventFlagFuncs[] = {
 #define THREADMAN_EVENT_FLAG_MATCH(pattern, bits, wait) \
     (((wait) & SCE_KERNEL_EW_OR) ? ((pattern) & (bits)) : (((pattern) & (bits)) == (bits)))
 
+/*
+ * PARITY-Q037 (cf293fa): UID attr | (k1 >> 31) passed to sceKernelCreateUID, as the original computes it.
+ * PARITY-Q085: Creation failure returns through its own resume/return tail (success path dedented).
+ * PARITY-Q042: uid->uid read first, then the stores in the order that schedules as the original (option, owner,
+ *     attr, curPattern, ownerWaitCount, initPattern).
+ */
 // Subroutine sceKernelCreateEventFlag - Address 0x00005138
 SceUID sceKernelCreateEventFlag(const char *name, int attr, int bits, SceKernelEventFlagOptParam *opt)
 {
@@ -76,19 +81,22 @@ SceUID sceKernelCreateEventFlag(const char *name, int attr, int bits, SceKernelE
 
     intr = sceKernelCpuSuspendIntr();
 
-    status = sceKernelCreateUID(g_threadman.eventFlagType, name, (pspGetK1() >> 31) | attr, &uid);
-    if (status == SCE_ERROR_OK) {
-        eventFlag = UID_CB_TO_DATA(uid, g_threadman.eventFlagType, SceThreadmanEventFlag);
-        waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
-        eventFlag->option = opt;
-        eventFlag->owner = NULL;
-        waitQ->attr = attr;
-        eventFlag->initPattern = bits;
-        eventFlag->curPattern = bits;
-        eventFlag->ownerWaitCount = 0;
-        status = uid->uid;
-        THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_EVENT_FLAG, 1, status);
+    status = sceKernelCreateUID(g_threadman.eventFlagType, name, attr | (pspGetK1() >> 31), &uid);
+    if (status != SCE_ERROR_OK) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return status;
     }
+    eventFlag = UID_CB_TO_DATA(uid, g_threadman.eventFlagType, SceThreadmanEventFlag);
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    status = uid->uid;
+    eventFlag->option = opt;
+    eventFlag->owner = NULL;
+    waitQ->attr = attr;
+    eventFlag->curPattern = bits;
+    eventFlag->ownerWaitCount = 0;
+    eventFlag->initPattern = bits;
+    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_EVENT_FLAG, 1, status);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -130,14 +138,24 @@ int sceKernelDeleteEventFlag(int evid)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q047 (b2ff651): Interrupt state read raw / at the original's position.
+ * PARITY-Q060 (6d518d4): A 'matched' value tested / returned directly, as the original.
+ * PARITY-Q065: Guard and arm shape taken from the original's layout (!isIntr arm first, interrupt arm last).
+ * PARITY-Q077: Wake-up walk driven by the next local (`thread = next` at the top of the body, the original's
+ * register use: the next pointer is the loop variable, one instruction less than walking `thread`).
+ * PARITY-Q178: Each waiter's wait pattern is loaded into the bits parameter (dead once it is OR-ed into
+ * curPattern), not a separate local; the original's register use.
+ */
 // Subroutine sceKernelSetEventFlag - Address 0x000053C0
 int sceKernelSetEventFlag(SceUID evid, u32 bits)
 {
     s32 oldK1;
     s32 intr;
+    s32 ret;
     s32 isIntr;
     s32 numWokenUp;
-    u32 waitBits;
+    s32 matched;
     SceSysmemUidCB *uid;
     SceThreadmanEventFlag *eventFlag;
     SceThreadmanWaitQ *waitQ;
@@ -149,13 +167,14 @@ int sceKernelSetEventFlag(SceUID evid, u32 bits)
 
     intr = sceKernelCpuSuspendIntr();
 
-    if (sceKernelGetUIDcontrolBlockWithType(evid, g_threadman.eventFlagType, &uid) != SCE_ERROR_OK) {
+    ret = sceKernelGetUIDcontrolBlockWithType(evid, g_threadman.eventFlagType, &uid);
+    isIntr = pspCop0CtrlGet(COP0_CTRL_IS_INTERRUPT);
+    lastWokenUp = NULL;
+    if (ret != SCE_ERROR_OK) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_NOT_FOUND_EVENT_FLAG;
     }
-    lastWokenUp = NULL;
-    isIntr = THREADMAN_IS_INTR_CONTEXT();
     if (!THREADMAN_UID_PERM_OK(uid, SCE_THREADMAN_UID_ATTR_SIGNAL)) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
@@ -176,11 +195,13 @@ int sceKernelSetEventFlag(SceUID evid, u32 bits)
 
     /* Wake up the waiting threads, in order, whose wait condition is now satisfied. */
     numWokenUp = 0;
-    for (thread = (SceThreadmanThread *)waitQ->waitList.next;
-         thread != (SceThreadmanThread *)&waitQ->waitList && eventFlag->curPattern != 0; thread = next) {
-        waitBits = thread->waitData[0];
+    next = (SceThreadmanThread *)waitQ->waitList.next;
+    while (next != (SceThreadmanThread *)&waitQ->waitList && eventFlag->curPattern != 0) {
+        thread = next;
         next = (SceThreadmanThread *)thread->link.next;
-        if (!THREADMAN_EVENT_FLAG_MATCH(eventFlag->curPattern, waitBits, thread->waitData[1]))
+        bits = thread->waitData[0];
+        matched = THREADMAN_EVENT_FLAG_MATCH(eventFlag->curPattern, bits, thread->waitData[1]);
+        if (!matched)
             continue;
         if (sub_00000924(thread) > 0) {
             lastWokenUp = thread;
@@ -189,19 +210,21 @@ int sceKernelSetEventFlag(SceUID evid, u32 bits)
         if (thread->waitData[1] & SCE_KERNEL_EW_CLEAR_ALL)
             eventFlag->curPattern = 0;
         if (thread->waitData[1] & SCE_KERNEL_EW_CLEAR_PAT)
-            eventFlag->curPattern &= ~waitBits;
+            eventFlag->curPattern &= ~bits;
     }
 
-    if (isIntr) {
+    if (!isIntr) {
+        if (numWokenUp == 1) {
+            sub_00016BF4(lastWokenUp, lastWokenUp->currentPriority);
+            sub_00016C48(lastWokenUp, intr);
+        } else if (numWokenUp > 0) {
+            g_threadman.nextThread = NULL;
+            sub_00000FE4(0, intr);
+        }
+    } else {
         /* Reschedule when leaving the interrupt. */
         if (numWokenUp > 0)
             g_threadman.nextThread = NULL;
-    } else if (numWokenUp == 1) {
-        sub_00016BF4(lastWokenUp, lastWokenUp->currentPriority);
-        sub_00016C48(lastWokenUp, intr);
-    } else if (numWokenUp > 0) {
-        g_threadman.nextThread = NULL;
-        sub_00000FE4(0, intr);
     }
 
     sceKernelCpuResumeIntr(intr);
@@ -244,24 +267,23 @@ int sceKernelClearEventFlag(SceUID evid, u32 bits)
 }
 
 // Subroutine sceKernelWaitEventFlag - Address 0x00005730
-int sceKernelWaitEventFlag(int evid, u32 bits, u32 wait, u32 *outBits, SceUInt *timeout)
-{
-    return _sceKernelWaitEventFlag(evid, bits, wait, outBits, timeout, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelWaitEventFlag, _sceKernelWaitEventFlag, 0);
 
 // Subroutine sceKernelWaitEventFlagCB - Address 0x00005738
-int sceKernelWaitEventFlagCB(int evid, u32 bits, u32 wait, u32 *outBits, SceUInt *timeout)
-{
-    return _sceKernelWaitEventFlag(evid, bits, wait, outBits, timeout, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelWaitEventFlagCB, _sceKernelWaitEventFlag, 1);
 
+/*
+ * PARITY-Q048: Value read once into a local (the original keeps it in one register).
+ * PARITY-Q060 (a024847): A 'matched' value tested / returned directly, as the original.
+ */
 // Subroutine sub_00005740 - Address 0x00005740
-static s32 _sceKernelWaitEventFlag(SceUID evid, u32 bits, u32 wait, u32 *outBits, SceUInt *timeout,
-    s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelWaitEventFlag(SceUID evid, u32 bits, u32 wait, u32 *outBits, SceUInt *timeout)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     s32 status;
+    s32 matched;
     SceKernelSysClock timeoutClock;
     SceSysmemUidCB *uid;
     SceThreadmanEventFlag *eventFlag;
@@ -345,7 +367,8 @@ static s32 _sceKernelWaitEventFlag(SceUID evid, u32 bits, u32 wait, u32 *outBits
                 return SCE_ERROR_KERNEL_WAIT_DELETE;
             }
         }
-        if (THREADMAN_EVENT_FLAG_MATCH(eventFlag->curPattern, bits, wait)) {
+        matched = THREADMAN_EVENT_FLAG_MATCH(eventFlag->curPattern, bits, wait);
+        if (matched) {
             if (outBits != NULL)
                 *outBits = eventFlag->curPattern;
             if (wait & SCE_KERNEL_EW_CLEAR_ALL)
@@ -356,12 +379,14 @@ static s32 _sceKernelWaitEventFlag(SceUID evid, u32 bits, u32 wait, u32 *outBits
                 eventFlag->owner = NULL;
                 threadmanListRemove(&eventFlag->ownerLink);
             }
-            status = SCE_ERROR_OK;
-            break;
+            sceKernelCpuResumeIntr(intr);
+            pspSetK1(oldK1);
+            return SCE_ERROR_OK;
         }
+        /* PARITY-Q071: outBits is stored before wait (the original's store order) */
         thread->waitData[0] = bits;
-        thread->waitData[1] = wait;
         thread->waitData[2] = (s32)outBits;
+        thread->waitData[1] = wait;
         thread->waitWithCallbacks = withCallbacks;
         status = sub_00000908(uid, SCE_THREADMAN_WAIT_EVENT_FLAG, 0, &timeoutClock, timeout);
     } while (withCallbacks && status == (s32)SCE_ERROR_KERNEL_WAIT_STATUS_RELEASED_CALLBACK);
@@ -487,7 +512,6 @@ int sceKernelReferEventFlagStatus(SceUID event, SceKernelEventFlagInfo *status)
 {
     s32 oldK1;
     s32 intr;
-    u32 *ptr;
     SceSysmemUidCB *uid;
     SceThreadmanEventFlag *eventFlag;
     SceThreadmanWaitQ *waitQ;
@@ -517,8 +541,8 @@ int sceKernelReferEventFlagStatus(SceUID event, SceKernelEventFlagInfo *status)
     eventFlag = UID_CB_TO_DATA(uid, g_threadman.eventFlagType, SceThreadmanEventFlag);
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     buf = &g_threadman.statusBuf.eventFlagInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     if (uid->name != NULL)
         strncpy(buf->name, uid->name, SCE_UID_NAME_LEN);
@@ -526,7 +550,7 @@ int sceKernelReferEventFlagStatus(SceUID event, SceKernelEventFlagInfo *status)
     buf->initPattern = eventFlag->initPattern;
     buf->currentPattern = eventFlag->curPattern;
     buf->numWaitThreads = waitQ->numWaitThreads;
-    memcpy(status, buf, (buf->size < status->size) ? buf->size : status->size);
+    THREADMAN_COPY_STATUS(status, &g_threadman.statusBuf.eventFlagInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -537,20 +561,25 @@ int sceKernelReferEventFlagStatus(SceUID event, SceKernelEventFlagInfo *status)
  * Release the ownership of all the event flags owned by a thread (called when the thread terminates, so that
  * other threads can wait on them again).
  */
+/*
+ * PARITY-Q042 (503f2bb): Statement/store order taken from the original's store order.
+ * PARITY-Q050 (503f2bb): Loop shape (guarded block instead of continue / separate next cursor / head pointer walk) as
+ *     the original's layout.
+ */
 // Subroutine sub_000060D4 - Address 0x000060D4
 void _sceKernelEventFlagReleaseOwned(SceThreadmanThread *thread)
 {
     SceThreadmanListEntry *entry;
-    SceThreadmanListEntry *next;
     SceThreadmanEventFlag *eventFlag;
 
-    for (entry = thread->ownedEventFlags.next; entry != &thread->ownedEventFlags; entry = next) {
+    entry = thread->ownedEventFlags.next;
+    while (entry != &thread->ownedEventFlags) {
         eventFlag = THREADMAN_EVENT_FLAG_FROM_OWNER_LINK(entry);
-        next = entry->next;
+        entry = entry->next;
         if (eventFlag->owner != NULL) {
             eventFlag->owner = NULL;
-            threadmanListRemove(&eventFlag->ownerLink);
             eventFlag->ownerWaitCount = 0;
+            threadmanListRemove(&eventFlag->ownerLink);
         }
     }
 }

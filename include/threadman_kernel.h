@@ -392,7 +392,7 @@ typedef struct SceKernelThreadKInfo {
     char        name[SCE_UID_NAME_LEN + 1]; // 4
     SceUInt     attr; // 36
     s32         status; // 40
-    SceKernelThreadEntry entry; // 44
+    void        *entry; // 44
     void        *stack; // 48
     s32         stackSize; // 52
     /** The kernel stack of a user mode thread. */

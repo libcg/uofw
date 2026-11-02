@@ -24,7 +24,7 @@
 /** The valid lightweight mutex attributes. */
 #define SCE_THREADMAN_LW_MUTEX_ATTR_MASK    (0x3FF)
 
-static s32 _sceKernelWaitLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout, s32 withCallbacks);
+static s32 __attribute__((used)) _sceKernelWaitLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout);
 static s32 _sceKernelLwMutexEndWait(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelLwMutexWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelLwMutexInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
@@ -39,6 +39,17 @@ SceSysmemUidLookupFunc g_LwMutexFuncs[] = {
     { 0, NULL }
 };
 
+/*
+ * PARITY-Q037 (cf293fa): UID attr | (k1 >> 31) passed to sceKernelCreateUID, as the original computes it.
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (c823030, a9f295b): Checks combined in one condition / merged identical error checks: the original
+ *     shares one branch.
+ * PARITY-Q045 (7868031): The new UID kept in a local id read before the data pointer (the original's register use).
+ * PARITY-Q046 (1598082): Object pointer derived before waitQ (the original loads the object's type word first).
+ * PARITY-Q051 (c99ebb4): Access through a local/named pointer (the original's addressing).
+ * PARITY-Q079: memcpy() destination named through g_threadman, not the opt local: the original re-derives
+ *     that address from the %hi part instead of reusing the pointer that cleared opt->size.
+ */
 /**
  * Create a lightweight mutex.
  *
@@ -60,9 +71,15 @@ s32 sceKernelCreateLwMutex(SceLwMutex *mutex, const char *name, u32 attr, s32 in
     SceSysmemUidCB *uid;
     SceThreadmanLwMutex *lwMutex;
     SceThreadmanWaitQ *waitQ;
+    SceUID id;
+    SceKernelLwMutexOptParam *opt = &g_threadman.statusBuf.lwMutexOption;
 
     oldK1 = pspShiftK1();
-    if (!pspK1PtrOk(mutex) || !pspK1PtrOk(name) || !pspK1StaBufOk(option, 4) || ((u32)mutex & 3) != 0) {
+    if (!pspK1PtrOk(mutex) || !pspK1PtrOk(name) || !pspK1StaBufOk(option, 4)) {
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
+    }
+    if (((u32)mutex & 3) != 0) {
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_ILLEGAL_ADDR;
     }
@@ -81,41 +98,45 @@ s32 sceKernelCreateLwMutex(SceLwMutex *mutex, const char *name, u32 attr, s32 in
 
     intr = sceKernelCpuSuspendIntr();
 
-    g_threadman.statusBuf.lwMutexOption.size = 0;
+    opt->size = 0;
     if (option != NULL)
         memcpy(&g_threadman.statusBuf.lwMutexOption, option, (option->size < 5) ? option->size : 4);
 
-    status = sceKernelCreateUID(g_threadman.lwMutexType, name, (pspGetK1() >> 31) | attr, &uid);
+    status = sceKernelCreateUID(g_threadman.lwMutexType, name, attr | (pspGetK1() >> 31), &uid);
     if (status != SCE_ERROR_OK) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return status;
     }
 
-    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    id = uid->uid;
     waitQ->attr = attr;
     lwMutex->option = option;
     lwMutex->initCount = initCount;
-    lwMutex->uid = uid->uid;
+    lwMutex->uid = id;
     lwMutex->workarea = mutex;
     mutex->flags = attr;
     mutex->lockCount = initCount;
     mutex->thid = 0;
-    mutex->unk3 = 0;
-    mutex->id = uid->uid;
-    mutex->unk20[0] = 0;
-    mutex->unk20[1] = 0;
-    mutex->unk20[2] = 0;
+    mutex->numWaitThreads = 0;
+    mutex->id = id;
+    mutex->pad[0] = 0;
+    mutex->pad[1] = 0;
+    mutex->pad[2] = 0;
     if (initCount > 0)
         mutex->thid = g_threadman.curThread->uid;
-    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_LW_MUTEX, 1, uid->uid);
+    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_LW_MUTEX, 1, id);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q051 (ddad211): Access through a local/named pointer (the original's addressing).
+ */
 /**
  * Delete a lightweight mutex. The threads waiting on it are released with SCE_ERROR_KERNEL_WAIT_DELETE.
  *
@@ -130,6 +151,7 @@ s32 sceKernelDeleteLwMutex(SceLwMutex *mutex)
     s32 intr;
     SceUID id;
     SceSysmemUidCB *uid;
+    SceThreadmanLwMutex *lwMutex;
 
     oldK1 = pspShiftK1();
     if (!pspK1PtrOk(mutex)) {
@@ -144,8 +166,13 @@ s32 sceKernelDeleteLwMutex(SceLwMutex *mutex)
     intr = sceKernelCpuSuspendIntr();
 
     id = mutex->id;
-    if (sceKernelGetUIDcontrolBlockWithType(id, g_threadman.lwMutexType, &uid) != SCE_ERROR_OK
-        || UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex)->workarea != mutex) {
+    if (sceKernelGetUIDcontrolBlockWithType(id, g_threadman.lwMutexType, &uid) != SCE_ERROR_OK) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_LWMUTEX_NOT_FOUND;
+    }
+    lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
+    if (lwMutex->workarea != mutex) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_LWMUTEX_NOT_FOUND;
@@ -158,14 +185,24 @@ s32 sceKernelDeleteLwMutex(SceLwMutex *mutex)
 
     THREADMAN_LOG(SCE_THREADMAN_LOG_DELETE_LW_MUTEX, 1, id);
     sceKernelDeleteUID(id);
-    mutex->id = -1;
     mutex->thid = -1;
+    mutex->id = -1;
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (d26a239): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ * PARITY-Q051 (a7f87d9): Access through a local/named pointer (the original's addressing).
+ * PARITY-Q083: still-locked case as `goto end` (goto prediction: the original's block frequencies and layout).
+ * PARITY-Q086: new owner's waitData[0] and uid read into block locals before the two stores: both are s32, so a
+ *     store to the user work area may alias the thread fields and the reads stay ahead of the stores, as in the
+ *     original.
+ */
 /**
  * Unlock a lightweight mutex owned by the current thread. When its lock count reaches 0, the mutex is given
  * to the first waiting thread, if any.
@@ -184,6 +221,7 @@ s32 _sceKernelUnlockLwMutex(SceLwMutex *mutex, s32 count)
     s32 wokenUp;
     SceUID id;
     SceSysmemUidCB *uid;
+    SceThreadmanLwMutex *lwMutex;
     SceThreadmanWaitQ *waitQ;
     SceThreadmanThread *thread;
     SceThreadmanThread *wokenUpThread;
@@ -202,8 +240,13 @@ s32 _sceKernelUnlockLwMutex(SceLwMutex *mutex, s32 count)
     intr = sceKernelCpuSuspendIntr();
 
     id = mutex->id;
-    if (sceKernelGetUIDcontrolBlockWithType(id, g_threadman.lwMutexType, &uid) != SCE_ERROR_OK
-        || UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex)->workarea != mutex) {
+    if (sceKernelGetUIDcontrolBlockWithType(id, g_threadman.lwMutexType, &uid) != SCE_ERROR_OK) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_LWMUTEX_NOT_FOUND;
+    }
+    lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
+    if (lwMutex->workarea != mutex) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_LWMUTEX_NOT_FOUND;
@@ -235,26 +278,29 @@ s32 _sceKernelUnlockLwMutex(SceLwMutex *mutex, s32 count)
     }
     newCount = mutex->lockCount - count;
     mutex->lockCount = newCount;
-    if (newCount <= 0) {
-        mutex->thid = 0;
-        mutex->lockCount = 0;
-        wokenUp = 0;
-        /* Give the mutex to the first waiting thread. */
-        thread = (SceThreadmanThread *)waitQ->waitList.next;
-        if (thread != (SceThreadmanThread *)&waitQ->waitList) {
-            mutex->lockCount = thread->waitData[0];
-            mutex->thid = thread->uid;
-            if (sub_00000924(thread) > 0) {
-                wokenUpThread = thread;
-                wokenUp = 1;
-            }
-        }
-        if (wokenUp == 1) {
-            sub_00016BF4(wokenUpThread, wokenUpThread->currentPriority);
-            sub_00016C48(wokenUpThread, intr);
+    if (newCount > 0)
+        goto end;
+    mutex->thid = 0;
+    mutex->lockCount = 0;
+    wokenUp = 0;
+    /* Give the mutex to the first waiting thread. */
+    thread = (SceThreadmanThread *)waitQ->waitList.next;
+    if (thread != (SceThreadmanThread *)&waitQ->waitList) {
+        s32 waitCount = thread->waitData[0];
+        SceUID thid = thread->uid;
+        mutex->lockCount = waitCount;
+        mutex->thid = thid;
+        if (sub_00000924(thread) > 0) {
+            wokenUpThread = thread;
+            wokenUp = 1;
         }
     }
+    if (wokenUp == 1) {
+        sub_00016BF4(wokenUpThread, wokenUpThread->currentPriority);
+        sub_00016C48(wokenUpThread, intr);
+    }
 
+end:
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
     return SCE_ERROR_OK;
@@ -270,10 +316,7 @@ s32 _sceKernelUnlockLwMutex(SceLwMutex *mutex, s32 count)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine _sceKernelLockLwMutex - Address 0x00007CD4
-s32 _sceKernelLockLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout)
-{
-    return _sceKernelWaitLwMutex(mutex, count, timeout, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(_sceKernelLockLwMutex, _sceKernelWaitLwMutex, 0);
 
 /**
  * Lock a lightweight mutex, waiting until it is available and running the callbacks notified meanwhile.
@@ -285,21 +328,26 @@ s32 _sceKernelLockLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout)
  * @return 0 on success, < 0 on error.
  */
 // Subroutine _sceKernelLockLwMutexCB - Address 0x00007CDC
-s32 _sceKernelLockLwMutexCB(SceLwMutex *mutex, s32 count, SceUInt *timeout)
-{
-    return _sceKernelWaitLwMutex(mutex, count, timeout, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(_sceKernelLockLwMutexCB, _sceKernelWaitLwMutex, 1);
 
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (b18d693): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ * PARITY-Q042 (926a77b): Statement/store order taken from the original's store order.
+ * PARITY-Q051 (a7f87d9): Access through a local/named pointer (the original's addressing).
+ */
 // Subroutine sub_00007CE4 - Address 0x00007CE4
-static s32 _sceKernelWaitLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelWaitLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     s32 status;
-    s32 newCount;
     SceUID id;
     SceKernelSysClock timeoutClock;
     SceSysmemUidCB *uid;
+    SceThreadmanLwMutex *lwMutex;
     SceThreadmanWaitQ *waitQ;
     SceThreadmanThread *thread;
 
@@ -323,8 +371,13 @@ static s32 _sceKernelWaitLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout,
     sub_00016FA4();
 
     id = mutex->id;
-    if (sceKernelGetUIDcontrolBlockWithType(id, g_threadman.lwMutexType, &uid) != SCE_ERROR_OK
-        || UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex)->workarea != mutex) {
+    if (sceKernelGetUIDcontrolBlockWithType(id, g_threadman.lwMutexType, &uid) != SCE_ERROR_OK) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_LWMUTEX_NOT_FOUND;
+    }
+    lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
+    if (lwMutex->workarea != mutex) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_LWMUTEX_NOT_FOUND;
@@ -356,13 +409,13 @@ static s32 _sceKernelWaitLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout,
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_LWMUTEX_RECURSIVE_NOT_ALLOWED;
         }
-        newCount = count + mutex->lockCount;
-        if (newCount < 0) {
+        count += mutex->lockCount;
+        if (count < 0) {
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_LWMUTEX_LOCK_OVERFLOW;
         }
-        mutex->lockCount = newCount;
+        mutex->lockCount = count;
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_OK;
@@ -386,14 +439,14 @@ static s32 _sceKernelWaitLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout,
              || ((waitQ->attr & SCE_THREADMAN_WAITQ_ATTR_PRIORITY)
                  && thread->currentPriority < ((SceThreadmanThread *)waitQ->waitList.next)->currentPriority))
             && mutex->thid == 0) {
-            mutex->lockCount = count;
             mutex->thid = thread->uid;
+            mutex->lockCount = count;
             status = SCE_ERROR_OK;
             break;
         }
         thread->waitData[0] = count;
         thread->waitWithCallbacks = withCallbacks;
-        status = sub_00000680(uid, SCE_THREADMAN_WAIT_LW_MUTEX, waitQ->attr, &timeoutClock, timeout, &mutex->unk3);
+        status = sub_00000680(uid, SCE_THREADMAN_WAIT_LW_MUTEX, waitQ->attr, &timeoutClock, timeout, &mutex->numWaitThreads);
     } while (withCallbacks && status == (s32)SCE_ERROR_KERNEL_WAIT_STATUS_RELEASED_CALLBACK);
 
     sceKernelCpuResumeIntr(intr);
@@ -401,6 +454,15 @@ static s32 _sceKernelWaitLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout,
     return status;
 }
 
+/*
+ * PARITY-Q040 (a142225): Separate ifs for the early error checks: the original gives each check its own branch.
+ * PARITY-Q041 (d26a239): Checks combined in one condition / merged identical error checks: the original shares one
+ *     branch.
+ * PARITY-Q042 (76fc38e): Statement/store order taken from the original's store order.
+ * PARITY-Q051 (a7f87d9): Access through a local/named pointer (the original's addressing).
+ * PARITY-Q085: The new-owner case returns through its own resume/return tail: cross-jumping merges it with the
+ *     common tail at the call, so intr is loaded in each path as in the original.
+ */
 /**
  * Lock a lightweight mutex without waiting.
  *
@@ -414,9 +476,9 @@ s32 _sceKernelTryLockLwMutex(SceLwMutex *mutex, s32 count)
 {
     s32 oldK1;
     s32 intr;
-    s32 newCount;
     SceUID id;
     SceSysmemUidCB *uid;
+    SceThreadmanLwMutex *lwMutex;
     SceThreadmanWaitQ *waitQ;
     SceThreadmanThread *thread;
 
@@ -433,8 +495,13 @@ s32 _sceKernelTryLockLwMutex(SceLwMutex *mutex, s32 count)
     intr = sceKernelCpuSuspendIntr();
 
     id = mutex->id;
-    if (sceKernelGetUIDcontrolBlockWithType(id, g_threadman.lwMutexType, &uid) != SCE_ERROR_OK
-        || UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex)->workarea != mutex) {
+    if (sceKernelGetUIDcontrolBlockWithType(id, g_threadman.lwMutexType, &uid) != SCE_ERROR_OK) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_KERNEL_LWMUTEX_NOT_FOUND;
+    }
+    lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
+    if (lwMutex->workarea != mutex) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_LWMUTEX_NOT_FOUND;
@@ -462,20 +529,23 @@ s32 _sceKernelTryLockLwMutex(SceLwMutex *mutex, s32 count)
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_LWMUTEX_RECURSIVE_NOT_ALLOWED;
         }
-        newCount = count + mutex->lockCount;
-        if (newCount < 0) {
+        count += mutex->lockCount;
+        if (count < 0) {
             sceKernelCpuResumeIntr(intr);
             pspSetK1(oldK1);
             return SCE_ERROR_KERNEL_LWMUTEX_LOCK_OVERFLOW;
         }
-        mutex->lockCount = newCount;
+        mutex->lockCount = count;
     } else if (mutex->thid != 0) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_LWMUTEX_LOCKED;
     } else {
-        mutex->lockCount = count;
         mutex->thid = thread->uid;
+        mutex->lockCount = count;
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return SCE_ERROR_OK;
     }
 
     sceKernelCpuResumeIntr(intr);
@@ -483,6 +553,11 @@ s32 _sceKernelTryLockLwMutex(SceLwMutex *mutex, s32 count)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q044 (f2d84ca): Register copy cb of the UID control block (the original does not reload the address-taken
+ *     uid from the stack).
+ * PARITY-Q049 (97fd427): If/else statements instead of ternaries (the original branches, no movz/movn).
+ */
 /**
  * Get the status of a lightweight mutex.
  *
@@ -496,12 +571,12 @@ s32 sceKernelReferLwMutexStatusByID(SceUID id, SceKernelLwMutexInfo *info)
 {
     s32 oldK1;
     s32 intr;
-    u32 *ptr;
     SceSysmemUidCB *uid;
     SceThreadmanLwMutex *lwMutex;
     SceThreadmanWaitQ *waitQ;
     SceLwMutex *mutex;
     SceKernelLwMutexInfo *buf;
+    SceSysmemUidCB *cb;
 
     oldK1 = pspShiftK1();
     if (!pspK1StaBufOk(info, sizeof(*info))) {
@@ -524,23 +599,27 @@ s32 sceKernelReferLwMutexStatusByID(SceUID id, SceKernelLwMutexInfo *info)
 
     THREADMAN_LOG(SCE_THREADMAN_LOG_REFER_LW_MUTEX_STATUS_BY_ID, 2, id, info);
 
-    lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
-    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    cb = uid;
+    lwMutex = UID_CB_TO_DATA(cb, g_threadman.lwMutexType, SceThreadmanLwMutex);
+    waitQ = UID_CB_TO_DATA(cb, g_threadman.waitQType, SceThreadmanWaitQ);
     mutex = lwMutex->workarea;
     buf = &g_threadman.statusBuf.lwMutexInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
-    if (uid->name != NULL)
-        strncpy(buf->name, uid->name, SCE_UID_NAME_LEN);
+    if (cb->name != NULL)
+        strncpy(buf->name, cb->name, SCE_UID_NAME_LEN);
     buf->workarea = mutex;
     buf->attr = waitQ->attr;
-    buf->uid = uid->uid;
+    buf->uid = cb->uid;
     buf->numWaitThreads = waitQ->numWaitThreads;
-    buf->currentOwner = (mutex->thid == 0) ? -1 : mutex->thid;
+    if (mutex->thid == 0)
+        buf->currentOwner = -1;
+    else
+        buf->currentOwner = mutex->thid;
     buf->currentCount = mutex->lockCount;
     buf->initCount = lwMutex->initCount;
-    memcpy(info, buf, (buf->size < info->size) ? buf->size : info->size);
+    THREADMAN_COPY_STATUS(info, &g_threadman.statusBuf.lwMutexInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -566,27 +645,38 @@ static s32 _sceKernelLwMutexInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidW
     return uid->uid;
 }
 
+/*
+ * PARITY-Q042 (11047a2): Statement/store order taken from the original's store order.
+ * PARITY-Q051 (1b312ea): Access through a local/named pointer (the original's addressing).
+ */
 // Subroutine sub_00008520 - Address 0x00008520
 static s32 _sceKernelLwMutexDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap)
 {
+    SceThreadmanLwMutex *lwMutex;
     SceLwMutex *mutex;
 
-    mutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex)->workarea;
-    mutex->lockCount = 0;
+    lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
+    mutex = lwMutex->workarea;
     mutex->thid = 0;
+    mutex->lockCount = 0;
     sceKernelCallUIDObjCommonFunction(uid, uidWithFunc, funcId, ap);
     return SCE_ERROR_OK;
 }
 
 /* A thread stopped waiting on the mutex: update the number of waiting threads, also in the work area. */
+/*
+ * PARITY-Q051 (38fcebd): Access through a local/named pointer (the original's addressing).
+ */
 // Subroutine sub_0000855C - Address 0x0000855C
 static s32 _sceKernelLwMutexEndWait(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc __attribute__((unused)),
     s32 funcId __attribute__((unused)), va_list ap __attribute__((unused)))
 {
     SceThreadmanWaitQ *waitQ;
+    SceThreadmanLwMutex *lwMutex;
 
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
-    UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex)->workarea->unk3--;
+    lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
+    lwMutex->workarea->numWaitThreads--;
     waitQ->numWaitThreads--;
     return SCE_ERROR_OK;
 }
@@ -595,27 +685,38 @@ static s32 _sceKernelLwMutexEndWait(SceSysmemUidCB *uid, SceSysmemUidCB *uidWith
  * Give an unlocked mutex to its first waiting thread (called by the WaitQ code, for example after a waiting
  * thread was released or its priority changed). Returns 1 if a thread has to be rescheduled, 0 otherwise.
  */
+/*
+ * PARITY-Q040 (1dfc604): Separate ifs for the early error checks: the original gives each check its own branch.
+ */
 // Subroutine sub_000085A8 - Address 0x000085A8
 static s32 _sceKernelLwMutexWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc __attribute__((unused)),
     s32 funcId __attribute__((unused)), va_list ap __attribute__((unused)))
 {
     s32 reschedule;
     SceLwMutex *mutex;
+    SceThreadmanLwMutex *lwMutex;
     SceThreadmanWaitQ *waitQ;
     SceThreadmanThread *thread;
+    SceUID thid;
+    s32 lockCount;
 
     reschedule = 0;
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
-    mutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex)->workarea;
+    lwMutex = UID_CB_TO_DATA(uid, g_threadman.lwMutexType, SceThreadmanLwMutex);
     if (waitQ->numWaitThreads <= 0)
         return 0;
 
     thread = (SceThreadmanThread *)waitQ->waitList.next;
-    if (thread == (SceThreadmanThread *)&waitQ->waitList || mutex->thid != 0)
-        return reschedule;
-
-    reschedule = (sub_00000924(thread) > 0);
-    mutex->thid = thread->uid;
-    mutex->lockCount = thread->waitData[0];
+    if (thread != (SceThreadmanThread *)&waitQ->waitList) {
+        mutex = lwMutex->workarea;
+        if (mutex->thid == 0) {
+            if (sub_00000924(thread) > 0)
+                reschedule = 1;
+            lockCount = thread->waitData[0];
+            thid = thread->uid;
+            mutex->lockCount = lockCount;
+            mutex->thid = thid;
+        }
+    }
     return reschedule;
 }

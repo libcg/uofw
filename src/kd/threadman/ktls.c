@@ -53,7 +53,7 @@ s32 sceKernelAllocateKTLS(s32 size, void (*destructor)(void *ktls, void *arg), v
             ktls->arg = arg;
             ktls->gp = sceKernelGetModuleGPByAddressForKernel((u32)destructor);
             if (ktls->gp == 0)
-                ktls->gp = pspGetGp();
+                ktls->gp = threadmanGetGp();
             ktls->used = 1;
 
             THREADMAN_LOG(SCE_THREADMAN_LOG_ALLOCATE_KTLS, 4, size, destructor, arg, id);
@@ -111,6 +111,18 @@ s32 sceKernelFreeKTLS(s32 id)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q040: Separate ifs for the early checks (interrupt context, then the KTLS id): the original gives each check its
+ * own branch.
+ */
+/*
+ * PARITY-Q118: the current thread's uid is read through g_threadman.curThread before thread is assigned
+ *     (thid = g_threadman.curThread->uid; thread = g_threadman.curThread;). CSE shares the load, and the
+ *     original's copy (lw a1 / lw 0x8(a1) / move a0, a1) appears. csim +0.253, equiv -> regalloc. A local copy
+ *     (cur = g_threadman.curThread; thid = cur->uid; thread = cur;) matches the same way; this form is kept
+ *     because it is closer to the original statement order. Residue: thid/ktls get $s2/$s3 swapped. Declaration order
+ *     and dropping the ktls variable do not fix it (the latter is down).
+ */
 /**
  * Get the KTLS block of a thread.
  *
@@ -130,15 +142,17 @@ void *sceKernelGetThreadKTLS(s32 id, SceUID thid, s32 alloc)
     SceThreadmanKtls *ktls;
     SceThreadmanThread *thread;
 
-    if (THREADMAN_IS_INTR_CONTEXT() || (u32)id >= SCE_THREADMAN_NUM_KTLS)
+    if (THREADMAN_IS_INTR_CONTEXT())
+        return NULL;
+    if ((u32)id >= SCE_THREADMAN_NUM_KTLS)
         return NULL;
 
     oldK1 = pspShiftK1();
     intr = sceKernelCpuSuspendIntr();
 
     if (thid == 0) {
+        thid = g_threadman.curThread->uid;
         thread = g_threadman.curThread;
-        thid = thread->uid;
     } else {
         if (sceKernelGetUIDcontrolBlockWithType(thid, g_threadman.threadType, &cb) != SCE_ERROR_OK) {
             sceKernelCpuResumeIntr(intr);
@@ -166,6 +180,7 @@ void *sceKernelGetThreadKTLS(s32 id, SceUID thid, s32 alloc)
             pspSetK1(oldK1);
             return NULL;
         }
+        /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
         memset(block, 0, ktls->size);
         thread->ktls[id] = block;
         ktls->numThreads++;
@@ -176,6 +191,9 @@ void *sceKernelGetThreadKTLS(s32 id, SceUID thid, s32 alloc)
     return block;
 }
 
+/*
+ * PARITY-Q005 (3d248ac): Uses volatile $gp swap around handler calls.
+ */
 /**
  * Release the KTLS blocks of a thread being deleted, calling the destructor of their allocation.
  * A destructor can only be called in the context of the thread itself: the blocks which have a destructor
@@ -207,8 +225,7 @@ s32 _sceKernelFreeThreadKTLS(SceThreadmanThread *thread)
                 kept = 1;
                 continue;
             }
-            oldGp = pspGetGp();
-            pspSetGp(ktls->gp);
+            oldGp = threadmanSwapGp(ktls->gp);
             ktls->destructor(block, ktls->arg);
             pspSetGp(oldGp);
         }

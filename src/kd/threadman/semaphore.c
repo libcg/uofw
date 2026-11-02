@@ -22,7 +22,7 @@
 /** The valid semaphore attributes. */
 #define SCE_THREADMAN_SEMA_ATTR_MASK    (0x1FF)
 
-static s32 _sceKernelWaitSema(SceUID semaid, s32 signal, SceUInt *timeout, s32 withCallbacks);
+static s32 __attribute__((used)) _sceKernelWaitSema(SceUID semaid, s32 signal, SceUInt *timeout);
 static s32 _sceKernelSemaMustWait(SceThreadmanWaitQ *waitQ);
 static s32 _sceKernelSemaWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
 static s32 _sceKernelSemaInitialize(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc, s32 funcId, va_list ap);
@@ -36,6 +36,12 @@ SceSysmemUidLookupFunc g_SemaFuncs[] = {
     { 0, NULL }
 };
 
+/*
+ * PARITY-Q037 (cf293fa): UID attr | (k1 >> 31) passed to sceKernelCreateUID, as the original computes it.
+ * PARITY-Q085: Creation failure returns through its own resume/return tail (success path dedented).
+ * PARITY-Q042: uid->uid read first, then the stores in the order that schedules as the original (option, attr,
+ *     initCount, curCount, maxCount).
+ */
 // Subroutine sceKernelCreateSema - Address 0x00004248
 SceUID sceKernelCreateSema(const char *name, SceUInt attr, int initVal, int maxVal, SceKernelSemaOptParam *option)
 {
@@ -62,18 +68,21 @@ SceUID sceKernelCreateSema(const char *name, SceUInt attr, int initVal, int maxV
 
     intr = sceKernelCpuSuspendIntr();
 
-    status = sceKernelCreateUID(g_threadman.semaType, name, (pspGetK1() >> 31) | attr, &uid);
-    if (status == SCE_ERROR_OK) {
-        sema = UID_CB_TO_DATA(uid, g_threadman.semaType, SceThreadmanSema);
-        waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
-        sema->option = option;
-        waitQ->attr = attr;
-        sema->maxCount = maxVal;
-        sema->curCount = initVal;
-        sema->initCount = initVal;
-        status = uid->uid;
-        THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_SEMA, 1, status);
+    status = sceKernelCreateUID(g_threadman.semaType, name, attr | (pspGetK1() >> 31), &uid);
+    if (status != SCE_ERROR_OK) {
+        sceKernelCpuResumeIntr(intr);
+        pspSetK1(oldK1);
+        return status;
     }
+    sema = UID_CB_TO_DATA(uid, g_threadman.semaType, SceThreadmanSema);
+    waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
+    status = uid->uid;
+    sema->option = option;
+    waitQ->attr = attr;
+    sema->initCount = initVal;
+    sema->curCount = initVal;
+    sema->maxCount = maxVal;
+    THREADMAN_LOG(SCE_THREADMAN_LOG_CREATE_SEMA, 1, status);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -115,11 +124,20 @@ int sceKernelDeleteSema(SceUID semaid)
     return SCE_ERROR_OK;
 }
 
+/*
+ * PARITY-Q047 (1aca79b): Interrupt state read raw / at the original's position.
+ * PARITY-Q065: Guard and arm shape taken from the original's layout (!isIntr arm first, interrupt arm last).
+ * PARITY-Q077: Wake-up walk driven by the next local (`thread = next` at the top of the body, the original's
+ * register use: the next pointer is the loop variable, one instruction less than walking `thread`).
+ * PARITY-Q088: Overflow-count walk also runs on `next`, so `thread` lives only in the wake-up walk (the shorter
+ *     lifetime gives the original's global allocation: thread in s0, next in fp; only regrename temps differ).
+ */
 // Subroutine sceKernelSignalSema - Address 0x000044D8
 int sceKernelSignalSema(SceUID semaid, int signal)
 {
     s32 oldK1;
     s32 intr;
+    s32 ret;
     s32 isIntr;
     s32 newCount;
     s32 numWokenUp;
@@ -135,12 +153,13 @@ int sceKernelSignalSema(SceUID semaid, int signal)
 
     intr = sceKernelCpuSuspendIntr();
 
-    if (sceKernelGetUIDcontrolBlockWithType(semaid, g_threadman.semaType, &uid) != SCE_ERROR_OK) {
+    ret = sceKernelGetUIDcontrolBlockWithType(semaid, g_threadman.semaType, &uid);
+    isIntr = pspCop0CtrlGet(COP0_CTRL_IS_INTERRUPT);
+    if (ret != SCE_ERROR_OK) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
         return SCE_ERROR_KERNEL_NOT_FOUND_SEMAPHORE;
     }
-    isIntr = THREADMAN_IS_INTR_CONTEXT();
     if (!THREADMAN_UID_PERM_OK(uid, SCE_THREADMAN_UID_ATTR_SIGNAL)) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
@@ -153,9 +172,9 @@ int sceKernelSignalSema(SceUID semaid, int signal)
 
     /* The count must not overflow, even after all the waiting threads took what they asked for. */
     newCount = sema->curCount + signal;
-    for (thread = (SceThreadmanThread *)waitQ->waitList.next; thread != (SceThreadmanThread *)&waitQ->waitList;
-         thread = (SceThreadmanThread *)thread->link.next)
-        newCount -= thread->waitData[0];
+    for (next = (SceThreadmanThread *)waitQ->waitList.next; next != (SceThreadmanThread *)&waitQ->waitList;
+         next = (SceThreadmanThread *)next->link.next)
+        newCount -= next->waitData[0];
     if (sema->maxCount < newCount) {
         sceKernelCpuResumeIntr(intr);
         pspSetK1(oldK1);
@@ -166,10 +185,15 @@ int sceKernelSignalSema(SceUID semaid, int signal)
 
     /* Wake up the waiting threads, in order, as long as their request can be satisfied. */
     numWokenUp = 0;
-    for (thread = (SceThreadmanThread *)waitQ->waitList.next; thread != (SceThreadmanThread *)&waitQ->waitList;
-         thread = next) {
+    next = (SceThreadmanThread *)waitQ->waitList.next;
+    while (next != (SceThreadmanThread *)&waitQ->waitList) {
+        thread = next;
         next = (SceThreadmanThread *)thread->link.next;
-        if (g_threadman.skipUserThreads
+        /*
+         * PARITY-Q015: skipUserThreads is predicted false so the skip test's block layout matches the
+         * original
+         */
+        if (__builtin_expect(g_threadman.skipUserThreads != 0, 0)
             && (THREADMAN_IS_USER_THREAD(thread) || (thread->attr & SCE_THREADMAN_THREAD_ATTR_UNK_08000000)))
             continue;
         if (sema->curCount < thread->waitData[0])
@@ -181,16 +205,18 @@ int sceKernelSignalSema(SceUID semaid, int signal)
         }
     }
 
-    if (isIntr) {
+    if (!isIntr) {
+        if (numWokenUp == 1) {
+            sub_00016BF4(lastWokenUp, lastWokenUp->currentPriority);
+            sub_00016C48(lastWokenUp, intr);
+        } else if (numWokenUp > 0) {
+            g_threadman.nextThread = NULL;
+            sub_00000FE4(0, intr);
+        }
+    } else {
         /* Reschedule when leaving the interrupt. */
         if (numWokenUp > 0)
             g_threadman.nextThread = NULL;
-    } else if (numWokenUp == 1) {
-        sub_00016BF4(lastWokenUp, lastWokenUp->currentPriority);
-        sub_00016C48(lastWokenUp, intr);
-    } else if (numWokenUp > 0) {
-        g_threadman.nextThread = NULL;
-        sub_00000FE4(0, intr);
     }
 
     sceKernelCpuResumeIntr(intr);
@@ -199,20 +225,15 @@ int sceKernelSignalSema(SceUID semaid, int signal)
 }
 
 // Subroutine sceKernelWaitSema - Address 0x0000474C
-int sceKernelWaitSema(SceUID semaid, int signal, SceUInt *timeout)
-{
-    return _sceKernelWaitSema(semaid, signal, timeout, 0);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelWaitSema, _sceKernelWaitSema, 0);
 
 // Subroutine sceKernelWaitSemaCB - Address 0x00004754
-int sceKernelWaitSemaCB(SceUID semaid, int signal, SceUInt *timeout)
-{
-    return _sceKernelWaitSema(semaid, signal, timeout, 1);
-}
+THREADMAN_WITH_CALLBACKS_THUNK(sceKernelWaitSemaCB, _sceKernelWaitSema, 1);
 
 // Subroutine sub_0000475C - Address 0x0000475C
-static s32 _sceKernelWaitSema(SceUID semaid, s32 signal, SceUInt *timeout, s32 withCallbacks)
+static s32 __attribute__((used)) _sceKernelWaitSema(SceUID semaid, s32 signal, SceUInt *timeout)
 {
+    s32 withCallbacks = threadmanGetWithCallbacks();
     s32 oldK1;
     s32 intr;
     s32 status;
@@ -404,6 +425,9 @@ int sceKernelCancelSema(SceUID semaid, int setCount, int *numWaitThreads)
  * Check whether a thread trying to take the semaphore has to wait even if the count is large enough, because
  * other threads are already waiting (in FIFO mode), or because a waiting thread has a higher or the same priority.
  */
+/*
+ * PARITY-Q056 (c3b7a81): Must-wait priority checks as if / else if (the original's branch chain).
+ */
 // Subroutine sub_00004D68 - Address 0x00004D68
 static s32 _sceKernelSemaMustWait(SceThreadmanWaitQ *waitQ)
 {
@@ -414,11 +438,16 @@ static s32 _sceKernelSemaMustWait(SceThreadmanWaitQ *waitQ)
     if (waitQ->numWaitThreads > 0) {
         for (thread = (SceThreadmanThread *)waitQ->waitList.next;
              thread != (SceThreadmanThread *)&waitQ->waitList; thread = (SceThreadmanThread *)thread->link.next) {
-            if (g_threadman.skipUserThreads
+            /*
+             * PARITY-Q015: skipUserThreads is predicted false so the skip test's block layout matches
+             * the original
+             */
+            if (__builtin_expect(g_threadman.skipUserThreads != 0, 0)
                 && (THREADMAN_IS_USER_THREAD(thread) || (thread->attr & SCE_THREADMAN_THREAD_ATTR_UNK_08000000)))
                 continue;
-            if ((waitQ->attr & SCE_THREADMAN_WAITQ_ATTR_PRIORITY) == 0
-                || thread->currentPriority <= g_threadman.curThread->currentPriority)
+            if ((waitQ->attr & SCE_THREADMAN_WAITQ_ATTR_PRIORITY) == 0)
+                mustWait = 1;
+            else if (thread->currentPriority <= g_threadman.curThread->currentPriority)
                 mustWait = 1;
             break;
         }
@@ -431,7 +460,6 @@ int sceKernelReferSemaStatus(SceUID semaid, SceKernelSemaInfo *info)
 {
     s32 oldK1;
     s32 intr;
-    u32 *ptr;
     SceSysmemUidCB *uid;
     SceThreadmanSema *sema;
     SceThreadmanWaitQ *waitQ;
@@ -461,8 +489,8 @@ int sceKernelReferSemaStatus(SceUID semaid, SceKernelSemaInfo *info)
     sema = UID_CB_TO_DATA(uid, g_threadman.semaType, SceThreadmanSema);
     waitQ = UID_CB_TO_DATA(uid, g_threadman.waitQType, SceThreadmanWaitQ);
     buf = &g_threadman.statusBuf.semaInfo;
-    for (ptr = (u32 *)buf; ptr != (u32 *)(buf + 1); ptr++)
-        *ptr = 0;
+    /* PARITY-Q019: constant-size clear as memset: 3.3's inline store loop is the original's */
+    memset(buf, 0, sizeof(*buf));
     buf->size = sizeof(*buf);
     if (uid->name != NULL)
         strncpy(buf->name, uid->name, SCE_UID_NAME_LEN);
@@ -471,7 +499,7 @@ int sceKernelReferSemaStatus(SceUID semaid, SceKernelSemaInfo *info)
     buf->currentCount = sema->curCount;
     buf->maxCount = sema->maxCount;
     buf->initCount = sema->initCount;
-    memcpy(info, buf, (buf->size < info->size) ? buf->size : info->size);
+    THREADMAN_COPY_STATUS(info, &g_threadman.statusBuf.semaInfo);
 
     sceKernelCpuResumeIntr(intr);
     pspSetK1(oldK1);
@@ -503,6 +531,10 @@ static s32 _sceKernelSemaDelete(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc
  * Wake up the waiting threads whose request can now be satisfied (called by the WaitQ code, for example after
  * a waiting thread was released or its priority changed). Returns the number of threads woken up.
  */
+/*
+ * PARITY-Q050 (4e5b0b9): Loop shape (guarded block instead of continue / separate next cursor / head pointer walk) as
+ *     the original's layout.
+ */
 // Subroutine sub_00005048 - Address 0x00005048
 static s32 _sceKernelSemaWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uidWithFunc __attribute__((unused)),
     s32 funcId __attribute__((unused)), va_list ap __attribute__((unused)))
@@ -519,10 +551,15 @@ static s32 _sceKernelSemaWakeupWaiters(SceSysmemUidCB *uid, SceSysmemUidCB *uidW
     if (waitQ->numWaitThreads <= 0)
         return 0;
 
-    for (thread = (SceThreadmanThread *)waitQ->waitList.next; thread != (SceThreadmanThread *)&waitQ->waitList;
-         thread = next) {
+    next = (SceThreadmanThread *)waitQ->waitList.next;
+    while (next != (SceThreadmanThread *)&waitQ->waitList) {
+        thread = next;
         next = (SceThreadmanThread *)thread->link.next;
-        if (g_threadman.skipUserThreads
+        /*
+         * PARITY-Q015: skipUserThreads is predicted false so the skip test's block layout matches the
+         * original
+         */
+        if (__builtin_expect(g_threadman.skipUserThreads != 0, 0)
             && (THREADMAN_IS_USER_THREAD(thread) || (thread->attr & SCE_THREADMAN_THREAD_ATTR_UNK_08000000)))
             continue;
         if (sema->curCount < thread->waitData[0])
