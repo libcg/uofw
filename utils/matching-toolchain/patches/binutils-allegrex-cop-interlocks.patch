@@ -1,0 +1,12 @@
+diff --git a/gas/config/tc-mips.c b/gas/config/tc-mips.c
+index a14fdcdd..c3ac6f51 100644
+--- a/gas/config/tc-mips.c
++++ b/gas/config/tc-mips.c
+@@ -610,6 +610,7 @@ static int mips_32bitmode = 0;
+     && mips_opts.isa != ISA_MIPS2                     \
+     && mips_opts.isa != ISA_MIPS3)                    \
+    || mips_opts.arch == CPU_R4300                     \
++   || mips_opts.arch == CPU_ALLEGREX                  \
+    || mips_opts.micromips                             \
+    )
+ 

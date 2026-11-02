@@ -1,0 +1,1101 @@
+diff --git a/gcc/combine.c b/gcc/combine.c
+index ff18634..4e288f6 100644
+--- a/gcc/combine.c
++++ b/gcc/combine.c
+@@ -5798,6 +5798,17 @@ expand_compound_operation (x)
+ 	return x;
+ 
+       len = INTVAL (XEXP (x, 1));
++
++#ifdef COMBINE_KEEP_HIGH_EXTRACT
++      /* Allegrex: keep an unsigned extract that reaches the top bit
++	 (one ext) instead of rewriting it as a logical shift.  */
++      if (COMBINE_KEEP_HIGH_EXTRACT && unsignedp
++	  && GET_MODE (x) == SImode
++	  && GET_CODE (XEXP (x, 0)) == REG
++	  && GET_MODE (XEXP (x, 0)) == SImode
++	  && len + INTVAL (XEXP (x, 2)) == GET_MODE_BITSIZE (SImode))
++	return x;
++#endif
+       pos = INTVAL (XEXP (x, 2));
+ 
+       /* If this goes outside the object being extracted, replace the object
+@@ -8040,6 +8051,7 @@ simplify_and_const_int (x, mode, varop, constop)
+      unsigned HOST_WIDE_INT constop;
+ {
+   unsigned HOST_WIDE_INT nonzero;
++  unsigned HOST_WIDE_INT orig_constop = constop;
+   int i;
+ 
+   /* Simplify VAROP knowing that we will be only looking at some of the
+@@ -8131,7 +8143,26 @@ simplify_and_const_int (x, mode, varop, constop)
+ 
+   /* If we are only masking insignificant bits, return VAROP.  */
+   if (constop == nonzero)
+-    x = varop;
++    {
++#ifdef COMBINE_KEEP_HIGH_EXTRACT
++      /* Allegrex: an explicit AND of exactly the bits a logical right
++	 shift leaves is kept as one bit-field extract (ext).  */
++      if (COMBINE_KEEP_HIGH_EXTRACT
++	  && x != 0 && GET_CODE (x) == AND && mode == SImode
++	  && orig_constop == nonzero
++	  && GET_CODE (varop) == LSHIFTRT
++	  && GET_CODE (XEXP (varop, 0)) == REG
++	  && GET_CODE (XEXP (varop, 1)) == CONST_INT
++	  && INTVAL (XEXP (varop, 1)) > 0
++	  && INTVAL (XEXP (varop, 1)) < GET_MODE_BITSIZE (mode))
++	x = gen_rtx_ZERO_EXTRACT (mode, XEXP (varop, 0),
++				  GEN_INT (GET_MODE_BITSIZE (mode)
++					   - INTVAL (XEXP (varop, 1))),
++				  XEXP (varop, 1));
++      else
++#endif
++	x = varop;
++    }
+   else
+     {
+       /* Otherwise, return an AND.  */
+diff --git a/gcc/config/mips/mips-protos.h b/gcc/config/mips/mips-protos.h
+index f5cc947..e9e3341 100644
+--- a/gcc/config/mips/mips-protos.h
++++ b/gcc/config/mips/mips-protos.h
+@@ -86,6 +86,7 @@ extern void		mips_va_start PARAMS ((tree, rtx));
+ extern struct rtx_def  *mips_va_arg PARAMS ((tree, tree));
+ 
+ extern void		expand_block_move PARAMS ((rtx *));
++extern int		mips_expand_clrstr PARAMS ((rtx *));
+ extern void		final_prescan_insn PARAMS ((rtx, rtx *, int));
+ extern void		init_cumulative_args PARAMS ((CUMULATIVE_ARGS *,
+ 						      tree, rtx));
+@@ -170,4 +171,12 @@ extern rtx		gen_int_relational PARAMS ((enum rtx_code, rtx, rtx,
+ extern void		gen_conditional_branch PARAMS ((rtx *, enum rtx_code));
+ #endif
+ 
++#ifdef RTX_CODE
++extern int mips_use_ins_ext_p PARAMS ((rtx, rtx, rtx));
++extern int and_operand PARAMS ((rtx, enum machine_mode));
++extern int allegrex_ins_mask_operand PARAMS ((rtx, enum machine_mode));
++#endif
++
++extern int mips_allegrex_ins_mask_p PARAMS ((HOST_WIDE_INT, int *, int *));
++
+ #endif /* ! GCC_MIPS_PROTOS_H */
+diff --git a/gcc/config/mips/mips.c b/gcc/config/mips/mips.c
+index cfc304a..0436f64 100644
+--- a/gcc/config/mips/mips.c
++++ b/gcc/config/mips/mips.c
+@@ -591,6 +591,7 @@ const struct mips_cpu_info mips_cpu_info_table[] = {
+ 
+   /* MIPS II */
+   { "r6000", PROCESSOR_R6000, 2 },
++  { "allegrex", PROCESSOR_ALLEGREX, 2 },
+ 
+   /* MIPS III */
+   { "r4000", PROCESSOR_R4000, 3 },
+@@ -631,6 +632,10 @@ const struct mips_cpu_info mips_cpu_info_table[] = {
+ #define MIPS_MARCH_CONTROLS_SOFT_FLOAT 0
+ #endif
+ 
++static void mips_init_builtins		PARAMS ((void));
++static rtx mips_expand_builtin		PARAMS ((tree, rtx, rtx,
++						 enum machine_mode, int));
++
+ /* Initialize the GCC target structure.  */
+ #undef TARGET_ASM_ALIGNED_HI_OP
+ #define TARGET_ASM_ALIGNED_HI_OP "\t.half\t"
+@@ -664,6 +669,11 @@ const struct mips_cpu_info mips_cpu_info_table[] = {
+ #undef TARGET_SCHED_USE_DFA_PIPELINE_INTERFACE
+ #define TARGET_SCHED_USE_DFA_PIPELINE_INTERFACE mips_use_dfa_pipeline_interface
+ 
++#undef TARGET_INIT_BUILTINS
++#define TARGET_INIT_BUILTINS mips_init_builtins
++#undef TARGET_EXPAND_BUILTIN
++#define TARGET_EXPAND_BUILTIN mips_expand_builtin
++
+ #undef TARGET_ENCODE_SECTION_INFO
+ #define TARGET_ENCODE_SECTION_INFO mips_encode_section_info
+ 
+@@ -3709,6 +3719,53 @@ block_move_loop (dest_reg, src_reg, bytes, align, orig_dest, orig_src)
+   emit_label (label);
+ 
+   bytes_rtx = GEN_INT (MAX_MOVE_BYTES);
++  if (Pmode == SImode && align >= UNITS_PER_WORD)
++    {
++      /* Allegrex: a word-aligned block move loop copies MAX_MOVE_REGS words per iteration as separate
++	 loads and stores: all the loads, the first store, both pointer increments, then the remaining
++	 stores relative to the stepped destination, the last of which fills the delay slot of the loop
++	 branch:
++
++	 1:	lw	t0,0(src)
++		lw	t1,4(src)
++		lw	t2,8(src)
++		lw	t3,12(src)
++		sw	t0,0(dst)
++		addiu	src,src,16
++		addiu	dst,dst,16
++		sw	t1,-12(dst)
++		sw	t2,-8(dst)
++		bne	src,end,1b
++		sw	t3,-4(dst)
++
++	 This is the shape of every 16-byte copy loop in the 6.60 kernel modules (224 of 224 sites,
++	 tm-match survey/bmloop.py and bmloop2.py).  */
++      rtx regs[MAX_MOVE_REGS];
++      int i;
++
++      for (i = 0; i < MAX_MOVE_REGS; i++)
++	{
++	  regs[i] = gen_reg_rtx (SImode);
++	  emit_move_insn (regs[i],
++			  adjust_automodify_address (src_mem, SImode,
++						     plus_constant (src_reg, i * UNITS_PER_WORD),
++						     i * UNITS_PER_WORD));
++	}
++      emit_move_insn (adjust_automodify_address (dest_mem, SImode, dest_reg, 0), regs[0]);
++      emit_insn (gen_addsi3 (src_reg, src_reg, bytes_rtx));
++      emit_insn (gen_addsi3 (dest_reg, dest_reg, bytes_rtx));
++      for (i = 1; i < MAX_MOVE_REGS; i++)
++	emit_move_insn (adjust_automodify_address (dest_mem, SImode,
++						   plus_constant (dest_reg,
++								  (i - MAX_MOVE_REGS) * UNITS_PER_WORD),
++						   i * UNITS_PER_WORD),
++			regs[i]);
++      emit_insn (gen_cmpsi (src_reg, final_src));
++      emit_jump_insn (gen_bne (label));
++      if (leftover)
++	emit_insn (gen_movstrsi_internal (dest_mem, src_mem, GEN_INT (leftover), align_rtx));
++      return;
++    }
+   emit_insn (gen_movstrsi_internal (dest_mem, src_mem, bytes_rtx, align_rtx));
+ 
+   if (Pmode == DImode)
+@@ -3767,6 +3824,48 @@ block_move_call (dest_reg, src_reg, bytes_rtx)
+    operands[2] is the number of bytes to move.
+    operands[3] is the alignment.  */
+ 
++/* Expand a clrstrsi: OPERANDS[0] is the BLKmode MEM to clear, OPERANDS[1] the length and OPERANDS[2]
++   the alignment in bytes.  A word-aligned block of constant size is cleared by a loop that steps a pointer
++   from DEST - SIZE up to DEST and stores at SIZE - 4 past the stepped pointer:
++
++	addiu	p,dest,-SIZE
++     1:	addiu	p,p,4
++	bne	p,dest,1b
++	sw	$0,SIZE-4(p)
++
++   so the end test compares against the destination register itself and needs no end pointer.  This is
++   the clear loop of the 6.60 kernel modules (74 sites in modulemgr, threadman, sysmem, iofilemgr and
++   loadcore, every word-aligned zero fill of them that is not an explicit count-down loop).  Return 0
++   (the caller then calls memset) for anything else.  */
++
++int
++mips_expand_clrstr (operands)
++     rtx operands[];
++{
++  rtx base, ptr, label, mem;
++  HOST_WIDE_INT size;
++
++  if (GET_CODE (operands[1]) != CONST_INT || GET_CODE (operands[2]) != CONST_INT
++      || INTVAL (operands[2]) < UNITS_PER_WORD)
++    return 0;
++  size = INTVAL (operands[1]);
++  if (size <= 0 || size % UNITS_PER_WORD != 0 || size > 0x7ff0)
++    return 0;
++
++  base = copy_addr_to_reg (XEXP (operands[0], 0));
++  ptr = gen_reg_rtx (Pmode);
++  label = gen_label_rtx ();
++  emit_insn (gen_addsi3 (ptr, base, GEN_INT (-size)));
++  emit_label (label);
++  emit_insn (gen_addsi3 (ptr, ptr, GEN_INT (UNITS_PER_WORD)));
++  mem = adjust_automodify_address (operands[0], SImode,
++				   plus_constant (ptr, size - UNITS_PER_WORD), 0);
++  set_mem_size (mem, GEN_INT (UNITS_PER_WORD));
++  emit_move_insn (mem, const0_rtx);
++  emit_cmp_and_jump_insns (ptr, base, NE, NULL_RTX, Pmode, 0, label);
++  return 1;
++}
++
+ void
+ expand_block_move (operands)
+      rtx operands[];
+@@ -5521,6 +5620,19 @@ override_options ()
+ void
+ mips_conditional_register_usage ()
+ {
++  /* Allegrex: the VFPU is coprocessor 2, so its registers are not fixed (they stay call-used, and no
++     SImode pseudo prefers COP2_REGS, so allocation is unchanged).  Effect: n_non_fixed_regs = 96 instead of
++     64, i.e. loop.c's movable threshold is 97 instead of 65.  Firmware evidence (6.60 kd modules): threadman
++     WaitEventFlag/SendMsgPipe/ReceiveMsgPipe/sub_00001580 hoists, loadcore doLinkLibraryEntries hoists 2,
++     audio audioMixerThread hoists buf+256, loadexec fixupArgsAddr constant order 32,4,8,128; no 6.60 site
++     contradicts it (a threshold 2 higher already hoists out of threadman sub_00001580's loop, which the original
++     does not).  */
++  if (TARGET_ALLEGREX)
++    {
++      int regno;
++      for (regno = COP2_REG_FIRST; regno <= COP2_REG_LAST; regno++)
++	fixed_regs[regno] = 0;
++    }
+   if (!TARGET_HARD_FLOAT)
+     {
+       int regno;
+@@ -10913,3 +11025,206 @@ iris6_asm_file_end (stream)
+ #endif /* TARGET_IRIX6 */
+ 
+ #include "gt-mips.h"
++
++
++/* Allegrex builtins (__builtin_allegrex_*), as provided by the original
++   ALLEGREX port and, later, pspdev's GCC 4.0.2 patch.  */
++
++enum allegrex_builtin
++{
++  ALLEGREX_BUILTIN_CLZ,
++  ALLEGREX_BUILTIN_CLO,
++  ALLEGREX_BUILTIN_WSBH,
++  ALLEGREX_BUILTIN_WSBW,
++  ALLEGREX_BUILTIN_BITREV,
++  ALLEGREX_BUILTIN_MIN,
++  ALLEGREX_BUILTIN_MAX,
++  ALLEGREX_BUILTIN_SYNC,
++  ALLEGREX_BUILTIN_CACHE,
++  ALLEGREX_BUILTIN_MAX_CODE
++};
++
++static void
++mips_init_builtins ()
++{
++  tree si_si, si_si_si, void_void, void_si_si;
++
++  if (!TARGET_ALLEGREX)
++    return;
++
++  si_si = build_function_type (integer_type_node,
++				tree_cons (NULL_TREE, integer_type_node,
++					   void_list_node));
++  si_si_si = build_function_type (integer_type_node,
++				   tree_cons (NULL_TREE, integer_type_node,
++					      tree_cons (NULL_TREE,
++							 integer_type_node,
++							 void_list_node)));
++  void_void = build_function_type (void_type_node, void_list_node);
++  void_si_si = build_function_type (void_type_node,
++				     tree_cons (NULL_TREE, integer_type_node,
++						tree_cons (NULL_TREE,
++							   integer_type_node,
++							   void_list_node)));
++
++  builtin_function ("__builtin_allegrex_clz", si_si, ALLEGREX_BUILTIN_CLZ,
++		    BUILT_IN_MD, NULL, NULL_TREE);
++  builtin_function ("__builtin_allegrex_clo", si_si, ALLEGREX_BUILTIN_CLO,
++		    BUILT_IN_MD, NULL, NULL_TREE);
++  builtin_function ("__builtin_allegrex_wsbh", si_si, ALLEGREX_BUILTIN_WSBH,
++		    BUILT_IN_MD, NULL, NULL_TREE);
++  builtin_function ("__builtin_allegrex_wsbw", si_si, ALLEGREX_BUILTIN_WSBW,
++		    BUILT_IN_MD, NULL, NULL_TREE);
++  builtin_function ("__builtin_allegrex_bitrev", si_si, ALLEGREX_BUILTIN_BITREV,
++		    BUILT_IN_MD, NULL, NULL_TREE);
++  builtin_function ("__builtin_allegrex_min", si_si_si, ALLEGREX_BUILTIN_MIN,
++		    BUILT_IN_MD, NULL, NULL_TREE);
++  builtin_function ("__builtin_allegrex_max", si_si_si, ALLEGREX_BUILTIN_MAX,
++		    BUILT_IN_MD, NULL, NULL_TREE);
++  builtin_function ("__builtin_allegrex_sync", void_void, ALLEGREX_BUILTIN_SYNC,
++		    BUILT_IN_MD, NULL, NULL_TREE);
++  builtin_function ("__builtin_allegrex_cache", void_si_si,
++		    ALLEGREX_BUILTIN_CACHE, BUILT_IN_MD, NULL, NULL_TREE);
++}
++
++static rtx
++mips_expand_builtin (exp, target, subtarget, mode, ignore)
++     tree exp;
++     rtx target;
++     rtx subtarget ATTRIBUTE_UNUSED;
++     enum machine_mode mode ATTRIBUTE_UNUSED;
++     int ignore ATTRIBUTE_UNUSED;
++{
++  tree fndecl = TREE_OPERAND (TREE_OPERAND (exp, 0), 0);
++  tree arglist = TREE_OPERAND (exp, 1);
++  int fcode = DECL_FUNCTION_CODE (fndecl);
++  rtx op0 = NULL_RTX, op1 = NULL_RTX;
++
++  if (arglist)
++    {
++      op0 = expand_expr (TREE_VALUE (arglist), NULL_RTX, SImode, 0);
++      if (TREE_CHAIN (arglist))
++	op1 = expand_expr (TREE_VALUE (TREE_CHAIN (arglist)), NULL_RTX,
++			   SImode, 0);
++    }
++
++  if (fcode == ALLEGREX_BUILTIN_SYNC)
++    {
++      emit_insn (gen_allegrex_sync ());
++      return NULL_RTX;
++    }
++  if (fcode == ALLEGREX_BUILTIN_CACHE)
++    {
++      if (GET_CODE (op0) != CONST_INT)
++	{
++	  error ("the first argument of __builtin_allegrex_cache must be a constant");
++	  return NULL_RTX;
++	}
++      emit_insn (gen_allegrex_cache (op0, force_reg (SImode, op1)));
++      return NULL_RTX;
++    }
++
++  if (target == 0 || GET_MODE (target) != SImode
++      || !register_operand (target, SImode))
++    target = gen_reg_rtx (SImode);
++  op0 = force_reg (SImode, op0);
++  if (op1)
++    op1 = force_reg (SImode, op1);
++
++  switch (fcode)
++    {
++    case ALLEGREX_BUILTIN_CLZ:
++      emit_insn (gen_allegrex_clz (target, op0));
++      break;
++    case ALLEGREX_BUILTIN_CLO:
++      emit_insn (gen_allegrex_clo (target, op0));
++      break;
++    case ALLEGREX_BUILTIN_WSBH:
++      emit_insn (gen_allegrex_wsbh (target, op0));
++      break;
++    case ALLEGREX_BUILTIN_WSBW:
++      emit_insn (gen_allegrex_wsbw (target, op0));
++      break;
++    case ALLEGREX_BUILTIN_BITREV:
++      emit_insn (gen_allegrex_bitrev (target, op0));
++      break;
++    case ALLEGREX_BUILTIN_MIN:
++      emit_insn (gen_sminsi3 (target, op0, op1));
++      break;
++    case ALLEGREX_BUILTIN_MAX:
++      emit_insn (gen_smaxsi3 (target, op0, op1));
++      break;
++    default:
++      abort ();
++    }
++  return target;
++}
++
++/* True if an ext or ins of SIZE bits at POSITION of register OP can be
++   done with one Allegrex instruction.  */
++
++int
++mips_use_ins_ext_p (op, size, position)
++     rtx op, size, position;
++{
++  HOST_WIDE_INT len, pos;
++
++  if (!ISA_HAS_EXT_INS
++      || !register_operand (op, VOIDmode)
++      || GET_MODE_BITSIZE (GET_MODE (op)) > BITS_PER_WORD
++      || GET_CODE (size) != CONST_INT || GET_CODE (position) != CONST_INT)
++    return 0;
++
++  len = INTVAL (size);
++  pos = INTVAL (position);
++
++  if (len <= 0 || len >= GET_MODE_BITSIZE (GET_MODE (op))
++      || pos < 0 || pos + len > GET_MODE_BITSIZE (GET_MODE (op)))
++    return 0;
++
++  return 1;
++}
++
++/* True if VALUE, as an SImode AND mask, clears exactly one contiguous run
++   of bits that does not fit andi; store the run in *POS and *SIZE.  */
++
++int
++mips_allegrex_ins_mask_p (value, pos, size)
++     HOST_WIDE_INT value;
++     int *pos, *size;
++{
++  unsigned HOST_WIDE_INT m = ~(unsigned HOST_WIDE_INT) value & 0xffffffff;
++  int lsb, n;
++
++  if (!TARGET_ALLEGREX || TARGET_MIPS16 || m == 0
++      || ((value & 0xffffffff) & ~(HOST_WIDE_INT) 0xffff) == 0)
++    return 0;
++  for (lsb = 0; !(m & 1); lsb++)
++    m >>= 1;
++  if (m & (m + 1))
++    return 0;
++  for (n = 0; m; n++)
++    m >>= 1;
++  if (pos)
++    *pos = lsb;
++  if (size)
++    *size = n;
++  return 1;
++}
++
++int
++allegrex_ins_mask_operand (op, mode)
++     rtx op;
++     enum machine_mode mode ATTRIBUTE_UNUSED;
++{
++  return (GET_CODE (op) == CONST_INT
++	  && mips_allegrex_ins_mask_p (INTVAL (op), NULL, NULL));
++}
++
++int
++and_operand (op, mode)
++     rtx op;
++     enum machine_mode mode;
++{
++  return uns_arith_operand (op, mode) || allegrex_ins_mask_operand (op, mode);
++}
+diff --git a/gcc/config/mips/mips.h b/gcc/config/mips/mips.h
+index ad05be5..63cee49 100644
+--- a/gcc/config/mips/mips.h
++++ b/gcc/config/mips/mips.h
+@@ -76,7 +76,8 @@ enum processor_type {
+   PROCESSOR_R5KC,
+   PROCESSOR_R20KC,
+   PROCESSOR_SR71000,
+-  PROCESSOR_SB1
++  PROCESSOR_SB1,
++  PROCESSOR_ALLEGREX
+ };
+ 
+ /* Recast the cpu class to be the cpu attribute.  */
+@@ -148,6 +149,9 @@ extern int ignore_line_number;		/* != 0 if we are to ignore next .loc */
+ extern int file_in_function_warning;	/* warning given about .file in func */
+ extern int sdb_label_count;		/* block start/end next label # */
+ extern int sdb_begin_function_line;     /* Starting Line of current function */
++/* Nonzero while expmed.c expands a bit-field store; read by the Allegrex
++   andsi3 expander.  */
++extern int allegrex_bitfield_store_depth;
+ extern int mips_section_threshold;	/* # bytes of data/sdata cutoff */
+ extern int g_switch_value;		/* value of the -G xx switch */
+ extern int g_switch_set;		/* whether -G xx was passed.  */
+@@ -365,6 +369,12 @@ extern void		sbss_section PARAMS ((void));
+ #define TARGET_MIPS5500             (mips_arch == PROCESSOR_R5500)
+ #define TARGET_SB1                  (mips_arch == PROCESSOR_SB1)
+ #define TARGET_SR71K                (mips_arch == PROCESSOR_SR71000)
++#define TARGET_ALLEGREX             (mips_arch == PROCESSOR_ALLEGREX)
++
++/* combine.c: keep (and (lshiftrt x C) (mask >> C)) as a zero_extract
++   (the original 6.60 firmware has ~1100 such ext with pos+size == 32 and never
++   a srl feeding a variable shift where the source masks the count).  */
++#define COMBINE_KEEP_HIGH_EXTRACT   (TARGET_ALLEGREX)
+ 
+ /* Scheduling target defines.  */
+ #define TUNE_MIPS3000               (mips_tune == PROCESSOR_R3000)
+@@ -376,6 +386,7 @@ extern void		sbss_section PARAMS ((void));
+ #define TUNE_MIPS6000               (mips_tune == PROCESSOR_R6000)
+ #define TUNE_SB1                    (mips_tune == PROCESSOR_SB1)
+ #define TUNE_SR71K                  (mips_tune == PROCESSOR_SR71000)
++#define TUNE_ALLEGREX               (mips_tune == PROCESSOR_ALLEGREX)
+ 
+ /* Define preprocessor macros for the -march and -mtune options.
+    PREFIX is either _MIPS_ARCH or _MIPS_TUNE, INFO is the selected
+@@ -811,7 +822,7 @@ extern void		sbss_section PARAMS ((void));
+ 				 && !TARGET_MIPS16)
+ 
+ /* ISA has just the integer condition move instructions (movn,movz) */
+-#define ISA_HAS_INT_CONDMOVE     0
++#define ISA_HAS_INT_CONDMOVE     (TARGET_ALLEGREX)
+ 
+ /* ISA has the mips4 FP condition code instructions: FP-compare to CC,
+    branch on CC, and move (both FP and non-FP) on CC.  */
+@@ -844,6 +855,7 @@ extern void		sbss_section PARAMS ((void));
+ /* ISA has count leading zeroes/ones instruction (not implemented).  */
+ #define ISA_HAS_CLZ_CLO         ((ISA_MIPS32				\
+                                   || ISA_MIPS64				\
++                                  || TARGET_ALLEGREX			\
+                                  ) && !TARGET_MIPS16)
+ 
+ /* ISA has double-word count leading zeroes/ones instruction (not
+@@ -880,6 +892,7 @@ extern void		sbss_section PARAMS ((void));
+ 
+ /* ISA has 32-bit rotate right instruction.  */
+ #define ISA_HAS_ROTR_SI         (TARGET_MIPS5400                        \
++                                 || TARGET_ALLEGREX                     \
+                                  || TARGET_MIPS5500                     \
+                                  || TARGET_SR71K                        \
+                                  )
+@@ -898,6 +911,12 @@ extern void		sbss_section PARAMS ((void));
+ 				  || ISA_MIPS64)	       		\
+ 				 && !TARGET_MIPS16)
+ 
++/* ISA has the ext and ins bit field instructions (Allegrex; later MIPS32r2).  */
++#define ISA_HAS_EXT_INS         (TARGET_ALLEGREX && !TARGET_MIPS16)
++
++/* ISA has the min and max instructions (Allegrex).  */
++#define ISA_HAS_MIN_MAX         (TARGET_ALLEGREX && !TARGET_MIPS16)
++
+ /* True if trunc.w.s and trunc.w.d are real (not synthetic)
+    instructions.  Both require TARGET_HARD_FLOAT, and trunc.w.d
+    also requires TARGET_DOUBLE_FLOAT.  */
+@@ -1504,7 +1523,9 @@ do {							\
+ /* The largest size of value that can be held in floating-point
+    registers.  */
+ #define UNITS_PER_FPVALUE \
+-  (TARGET_SOFT_FLOAT ? 0 : (LONG_DOUBLE_TYPE_SIZE / BITS_PER_UNIT))
++  (TARGET_SOFT_FLOAT ? 0 \
++   : TARGET_SINGLE_FLOAT ? UNITS_PER_FPREG \
++   : (LONG_DOUBLE_TYPE_SIZE / BITS_PER_UNIT))
+ 
+ /* The number of bytes in a double.  */
+ #define UNITS_PER_DOUBLE (TYPE_PRECISION (double_type_node) / BITS_PER_UNIT)
+@@ -1592,7 +1613,7 @@ do {							\
+ #define STRUCTURE_SIZE_BOUNDARY 8
+ 
+ /* There is no point aligning anything to a rounder boundary than this.  */
+-#define BIGGEST_ALIGNMENT LONG_DOUBLE_TYPE_SIZE
++#define BIGGEST_ALIGNMENT (TARGET_ALLEGREX ? 128 : LONG_DOUBLE_TYPE_SIZE)
+ 
+ /* Set this nonzero if move instructions will actually fail to work
+    when given unaligned data.  */
+@@ -2570,8 +2591,9 @@ extern enum reg_class mips_char_to_class[256];
+    `current_function_outgoing_args_size'.  */
+ #define OUTGOING_REG_PARM_STACK_SPACE
+ 
++/* PSP (Allegrex) experiment: 16-byte stack alignment for EABI too.  */
+ #define STACK_BOUNDARY \
+-  ((mips_abi == ABI_32 || mips_abi == ABI_O64 || mips_abi == ABI_EABI) \
++  ((mips_abi == ABI_32 || mips_abi == ABI_O64) \
+    ? 64 : 128)
+ 
+ /* Make sure 4 words are always allocated on the stack.  */
+@@ -2874,7 +2896,7 @@ typedef struct mips_args {
+ /* Treat LOC as a byte offset from the stack pointer and round it up
+    to the next fully-aligned offset.  */
+ #define MIPS_STACK_ALIGN(LOC)						\
+-  ((mips_abi == ABI_32 || mips_abi == ABI_O64 || mips_abi == ABI_EABI)	\
++  ((mips_abi == ABI_32 || mips_abi == ABI_O64)	\
+    ? ((LOC) + 7) & ~7							\
+    : ((LOC) + 15) & ~15)
+ 
+@@ -3322,6 +3344,14 @@ typedef struct mips_args {
+ #define MOVE_MAX (TARGET_64BIT ? 8 : 4)
+ #define MAX_MOVE_MAX 8
+ 
++/* Allegrex: a constant-size clear of at most two pieces is stored by pieces; clrstrsi (mips.md) would
++   otherwise leave the default CLEAR_RATIO at 2, so a 5..8-byte aligned clear became the store loop or a
++   memset call.  The 6.60 firmware stores those inline: sysmem _ReturnSegBlankList clears its 8-byte
++   segment with two sw $zero, and the 5-byte password buffers of mlnbridge_msapp/vshbridge_msapp
++   (sceMlnBridge_msapp_D527DEB0) are sw $zero + sb $zero; the smallest clear loop of the firmware is
++   0x14 bytes (5 words, threadman).  */
++#define CLEAR_RATIO 3
++
+ /* Define this macro as a C expression which is nonzero if
+    accessing less than a word of memory (i.e. a `char' or a
+    `short') is no faster than accessing a word of memory, i.e., if
+@@ -3761,7 +3791,7 @@ typedef struct mips_args {
+ /* ??? Fix this to be right for the R8000.  */
+ #define BRANCH_COST							\
+   ((! TARGET_MIPS16							\
+-    && (TUNE_MIPS4000 || TUNE_MIPS6000))	\
++    && (TUNE_MIPS4000 || TUNE_MIPS6000 || TUNE_ALLEGREX))	\
+    ? 2 : 1)
+ 
+ /* If defined, modifies the length assigned to instruction INSN as a
+@@ -3795,6 +3825,8 @@ typedef struct mips_args {
+ 
+ #define PREDICATE_CODES							\
+   {"uns_arith_operand",		{ REG, CONST_INT, SUBREG }},		\
++  {"and_operand",		{ REG, CONST_INT, SUBREG }},		\
++  {"allegrex_ins_mask_operand",	{ CONST_INT }},				\
+   {"arith_operand",		{ REG, CONST_INT, SUBREG }},		\
+   {"arith32_operand",		{ REG, CONST_INT, SUBREG }},		\
+   {"reg_or_0_operand",		{ REG, CONST_INT, CONST_DOUBLE, SUBREG }}, \
+@@ -4425,10 +4457,19 @@ do {									\
+    Instead, we use ASM_OUTPUT_CASE_LABEL to switch back to the .text
+    section if appropriate.  */
+ #undef ASM_OUTPUT_CASE_LABEL
++/* Allegrex: the PSP modules have their jump tables in .data, in function
++   output order between the variables of the same file (threadman 6.60: all
++   strings first, then the UID function tables and the jump tables
++   interleaved; ported from the GCC 4.0.2 recreation).  */
+ #define ASM_OUTPUT_CASE_LABEL(FILE, PREFIX, NUM, INSN)			\
+ do {									\
+   if (TARGET_EMBEDDED_PIC || TARGET_MIPS16)				\
+     function_section (current_function_decl);				\
++  else if (TARGET_ALLEGREX)						\
++    {									\
++      data_section ();							\
++      ASM_OUTPUT_ALIGN (FILE, 2);					\
++    }									\
+   ASM_OUTPUT_INTERNAL_LABEL (FILE, PREFIX, NUM);			\
+ } while (0)
+ 
+diff --git a/gcc/config/mips/mips.md b/gcc/config/mips/mips.md
+index 10087f7..100bcc4 100644
+--- a/gcc/config/mips/mips.md
++++ b/gcc/config/mips/mips.md
+@@ -47,7 +47,16 @@
+    (UNSPEC_CONSTTABLE_DF	17)
+    (UNSPEC_ALIGN_2		18)
+    (UNSPEC_ALIGN_4		19)
+-   (UNSPEC_ALIGN_8		20)])
++   (UNSPEC_ALIGN_8		20)
++
++   ;; Allegrex
++   (UNSPEC_CLZ			400)
++   (UNSPEC_CLO			401)
++   (UNSPEC_WSBH			402)
++   (UNSPEC_WSBW			403)
++   (UNSPEC_BITREV		404)
++   (UNSPEC_SYNC			405)
++   (UNSPEC_CACHE		406)])
+ 
+ 
+ ;; ....................
+@@ -125,7 +134,7 @@
+ 
+ ;; ??? Fix everything that tests this attribute.
+ (define_attr "cpu"
+-  "default,r3000,r3900,r6000,r4000,r4100,r4111,r4120,r4300,r4600,r4650,r5000,r5400,r5500,r8000,sr71000,r4kc,r5kc,r20kc"
++  "default,r3000,r3900,r6000,r4000,r4100,r4111,r4120,r4300,r4600,r4650,r5000,r5400,r5500,r8000,sr71000,r4kc,r5kc,r20kc,sb1,allegrex"
+   (const (symbol_ref "mips_cpu_attr")))
+ 
+ ;; Does the instruction have a mandatory delay slot?
+@@ -219,19 +228,62 @@
+        (eq_attr "cpu" "r3000,r3900,r4600,r4650,r4100,r4120,r4300,r5000"))
+   2 0)
+ 
+-(define_function_unit "memory"   1 0 (eq_attr "type" "store") 1 0)
++(define_function_unit "memory"   1 0
++  (and (eq_attr "type" "store") (eq_attr "cpu" "!allegrex"))
++  1 0)
++
++;; Allegrex: a store keeps the data-memory port busy for two more cycles,
++;; so a load or store cannot issue in the two cycles after it (ported from
++;; the GCC 4.0.2 recreation, issue delay 2 -> 3 on firmware evidence: in 6.60
++;; one-restore epilogues right after a call, `move $v0, K' precedes
++;; `lw $ra' 570/692 times when `sw $ra' is the insn before the jal, and
++;; follows it 24/24 with one insn in between and 176/183 with more, i.e. the
++;; port is blocked exactly through the second cycle after the store).
++;; For the same reason a load that depends on the store (may alias it) is
++;; costed 3 cycles after it (ready delay 1 -> 3): threadman 6.60 starts its
++;; small $k1 functions with `sw $fp' before the `lui' of the global address
++;; chain (GetThreadId, GetUserLevel, ...), which needs the stores' priority
++;; through the dependent `lw' to be at least that of the lui chain; and the
++;; store -> next-load distance histogram d=1..4 is 319/44/63/1 in the original
++;; vs 333/35/60/1 with 3, 333/44/53/5 with 1, 332/39/56/3 with 2.
++(define_function_unit "memory"   1 0
++  (and (eq_attr "type" "store") (eq_attr "cpu" "allegrex"))
++  3 3)
+ 
+ (define_function_unit "memory"   1 0 (eq_attr "type" "xfer") 2 0)
+ 
+ (define_function_unit "imuldiv"  1 0
+-  (eq_attr "type" "hilo")
++  (and (eq_attr "type" "hilo") (eq_attr "cpu" "!allegrex"))
+   1 3)
+ 
++;; Allegrex: mfhi/mflo do not hold the multiply unit, so a mult/multu (or
++;; madd) may issue in the cycle right after them.  In the 6.60 kd modules
++;; (pops excluded) `mfhi|mflo ; mult ; X' with X an ordinary non-branch,
++;; non-hi/lo insn occurs at 507 sites in 95 modules; with the generic 3-cycle
++;; reservation the scheduler would always have issued X first (our build of
++;; the uOFW kd sources: 0 such sites).  Example: the u64 overflow product in
++;; threadman's sceKernelCreateFpl (`mfhi; mflo; mult; addu').
++(define_function_unit "imuldiv"  1 0
++  (and (eq_attr "type" "hilo") (eq_attr "cpu" "allegrex"))
++  1 1)
++
+ (define_function_unit "imuldiv"  1 0
+   (and (eq_attr "type" "imul,imadd")
+-       (eq_attr "cpu" "!r3000,r3900,r4000,r4600,r4650,r4100,r4120,r4300,r5000"))
++       (eq_attr "cpu" "!r3000,r3900,r4000,r4600,r4650,r4100,r4120,r4300,r5000,allegrex"))
+   17 17)
+ 
++;; Allegrex: mult/multu (and madd) results are costed 5 cycles to mflo/mfhi.
++;; Measured against the 6.60 binaries: in sceSystimer's sceSTimerSetTMCY the
++;; original issues `mflo' after exactly four independent instructions and
++;; leaves the `move $a0' for the following call after the dependent `sw'; only
++;; a latency of 5 reproduces it (4 and 6 both differ, 17 hoists the move in
++;; front of the mflo).  Across the 6.60 kd modules the mult -> mflo distance
++;; peaks at 4 instructions between (927 of 4620 sites, 146 at 5) and is >= 6
++;; at only 329 sites, 260 of them in the seven near-identical pops modules.
++(define_function_unit "imuldiv"  1 0
++  (and (eq_attr "type" "imul,imadd") (eq_attr "cpu" "allegrex"))
++  5 5)
++
+ ;; On them mips16, we want to stronly discourage a mult from appearing
+ ;; after an mflo, since that requires explicit nop instructions.  We
+ ;; do this by pretending that mflo ties up the function unit for long
+@@ -2828,6 +2880,10 @@
+   DONE;
+ }")
+ 
++;; Allegrex/PSP: the divide-by-zero trap is emitted as "break 0,7" (code in the low
++;; 10-bit field).  PSP firmware 6.60: 2452 compiler div traps encode (0,7) vs 94 (7,0)
++;; (the latter from assembler div macros and asm); 1.50: 691 vs 2.  Equivalent to the
++;; one-operand break encoding of the original assembler.
+ (define_insn "div_trap_normal"
+   [(trap_if (eq (match_operand 0 "register_operand" "d,d")
+ 		(match_operand 1 "true_reg_or_0_operand" "d,J"))
+@@ -2852,16 +2908,16 @@
+       if (GENERATE_BRANCHLIKELY)
+ 	{
+           if (which_alternative == 1)
+-	    return \"%(beql\\t%0,$0,1f\\n\\tbreak\\t%2\\n%~1:%)\";
++	    return \"%(beql\\t%0,$0,1f\\n\\tbreak\\t0,%2\\n%~1:%)\";
+ 	  else
+-	    return \"%(beql\\t%0,%1,1f\\n\\tbreak\\t%2\\n%~1:%)\";
++	    return \"%(beql\\t%0,%1,1f\\n\\tbreak\\t0,%2\\n%~1:%)\";
+ 	}
+       else
+ 	{
+           if (which_alternative == 1)
+-	    return \"%(bne\\t%0,$0,1f\\n\\tnop\\n\\tbreak\\t%2\\n%~1:%)\";
++	    return \"%(bne\\t%0,$0,1f\\n\\tnop\\n\\tbreak\\t0,%2\\n%~1:%)\";
+ 	  else
+-	    return \"%(bne\\t%0,%1,1f\\n\\tnop\\n\\tbreak\\t%2\\n%~1:%)\";
++	    return \"%(bne\\t%0,%1,1f\\n\\tnop\\n\\tbreak\\t0,%2\\n%~1:%)\";
+ 	}
+     }
+   return \"\";
+@@ -3540,10 +3596,30 @@ move\\t%0,%z4\\n\\
+ (define_expand "andsi3"
+   [(set (match_operand:SI 0 "register_operand" "=d,d")
+ 	(and:SI (match_operand:SI 1 "uns_arith_operand" "%d,d")
+-		(match_operand:SI 2 "uns_arith_operand" "d,K")))]
++		(match_operand:SI 2 "and_operand" "d,K")))]
+   ""
+   "
+ {
++  int pos, size;
++
++  /* Allegrex: x & ~(((1 << size) - 1) << pos) -> ins x,$0,pos,size
++     at expand time only for an in-place x &= MASK and for bit-field
++     stores.  Any other AND with an ins mask stays (and y MASK) until
++     *andsi3_allegrex_ins, so it is a single-set arm that ifcvt can turn
++     into ins+movz/movn and a movable loop invariant, as in the original code.  */
++  if (GET_CODE (operands[2]) == CONST_INT
++      && mips_allegrex_ins_mask_p (INTVAL (operands[2]), &pos, &size)
++      && (allegrex_bitfield_store_depth
++	  || rtx_equal_p (operands[0], operands[1])))
++    {
++      emit_move_insn (operands[0], force_reg (SImode, operands[1]));
++      emit_insn (gen_insvsi_allegrex (operands[0], GEN_INT (size),
++				      GEN_INT (pos), const0_rtx));
++      DONE;
++    }
++  if (GET_CODE (operands[2]) == CONST_INT
++      && !SMALL_INT_UNSIGNED (operands[2]))
++    operands[2] = force_reg (SImode, operands[2]);
+   if (TARGET_MIPS16)
+     {
+       operands[1] = force_reg (SImode, operands[1]);
+@@ -4375,6 +4451,33 @@ move\\t%0,%z4\\n\\
+    (set_attr "mode"	"DI")
+    (set_attr "length"	"4,8")])
+ 
++;; Allegrex seh/seb: sign extension of a register in one instruction.
++;; 6.60 firmware: 3131 seh in 54 modules, 1543 seb in 119 modules, while adjacent
++;; sll/sra 16|24 pairs occur only 185 times in 17 modules (118 of them in the pops_*g copies).
++(define_insn "*extendhisi2_seh"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(sign_extend:SI (match_operand:HI 1 "register_operand" "d")))]
++  "TARGET_ALLEGREX"
++  "seh\t%0,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "*extendqihi2_seb"
++  [(set (match_operand:HI 0 "register_operand" "=d")
++	(sign_extend:HI (match_operand:QI 1 "register_operand" "d")))]
++  "TARGET_ALLEGREX"
++  "seb\t%0,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "*extendqisi2_seb"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(sign_extend:SI (match_operand:QI 1 "register_operand" "d")))]
++  "TARGET_ALLEGREX"
++  "seb\t%0,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
+ (define_expand "extendhisi2"
+   [(set (match_operand:SI 0 "register_operand" "")
+ 	(sign_extend:SI (match_operand:HI 1 "nonimmediate_operand" "")))]
+@@ -4384,6 +4487,14 @@ move\\t%0,%z4\\n\\
+   if (optimize && GET_CODE (operands[1]) == MEM)
+     operands[1] = force_not_mem (operands[1]);
+ 
++  /* Allegrex: register sign extension is a single seh.  */
++  if (TARGET_ALLEGREX && GET_CODE (operands[1]) != MEM)
++    {
++      emit_insn (gen_rtx_SET (VOIDmode, operands[0],
++			      gen_rtx_SIGN_EXTEND (SImode, operands[1])));
++      DONE;
++    }
++
+   if (GET_CODE (operands[1]) != MEM)
+     {
+       rtx op1   = gen_lowpart (SImode, operands[1]);
+@@ -4414,6 +4525,14 @@ move\\t%0,%z4\\n\\
+   if (optimize && GET_CODE (operands[1]) == MEM)
+     operands[1] = force_not_mem (operands[1]);
+ 
++  /* Allegrex: register sign extension is a single seb.  */
++  if (TARGET_ALLEGREX && GET_CODE (operands[1]) != MEM)
++    {
++      emit_insn (gen_rtx_SET (VOIDmode, operands[0],
++			      gen_rtx_SIGN_EXTEND (HImode, operands[1])));
++      DONE;
++    }
++
+   if (GET_CODE (operands[1]) != MEM)
+     {
+       rtx op0   = gen_lowpart (SImode, operands[0]);
+@@ -4446,6 +4565,14 @@ move\\t%0,%z4\\n\\
+   if (optimize && GET_CODE (operands[1]) == MEM)
+     operands[1] = force_not_mem (operands[1]);
+ 
++  /* Allegrex: register sign extension is a single seb.  */
++  if (TARGET_ALLEGREX && GET_CODE (operands[1]) != MEM)
++    {
++      emit_insn (gen_rtx_SET (VOIDmode, operands[0],
++			      gen_rtx_SIGN_EXTEND (SImode, operands[1])));
++      DONE;
++    }
++
+   if (GET_CODE (operands[1]) != MEM)
+     {
+       rtx op1   = gen_lowpart (SImode, operands[1]);
+@@ -4897,12 +5024,21 @@ move\\t%0,%z4\\n\\
+ ;; Only specify the mode operand 1, the rest are assumed to be word_mode.
+ (define_expand "extzv"
+   [(set (match_operand 0 "register_operand" "")
+-	(zero_extract (match_operand:QI 1 "memory_operand" "")
++	(zero_extract (match_operand 1 "nonimmediate_operand" "")
+ 		      (match_operand 2 "immediate_operand" "")
+ 		      (match_operand 3 "immediate_operand" "")))]
+   "!TARGET_MIPS16"
+   "
+ {
++  if (mips_use_ins_ext_p (operands[1], operands[2], operands[3]))
++    {
++      emit_insn (gen_extzvsi_allegrex (operands[0], operands[1], operands[2],
++				       operands[3]));
++      DONE;
++    }
++  if (GET_CODE (operands[1]) != MEM)
++    FAIL;
++
+   /* If the field does not start on a byte boundary, then fail.  */
+   if (INTVAL (operands[3]) % 8 != 0)
+     FAIL;
+@@ -4945,13 +5081,22 @@ move\\t%0,%z4\\n\\
+ 
+ ;; Only specify the mode operands 0, the rest are assumed to be word_mode.
+ (define_expand "insv"
+-  [(set (zero_extract (match_operand:QI 0 "memory_operand" "")
++  [(set (zero_extract (match_operand 0 "nonimmediate_operand" "")
+ 		      (match_operand 1 "immediate_operand" "")
+ 		      (match_operand 2 "immediate_operand" ""))
+-	(match_operand 3 "register_operand" ""))]
++	(match_operand 3 "reg_or_0_operand" ""))]
+   "!TARGET_MIPS16"
+   "
+ {
++  if (mips_use_ins_ext_p (operands[0], operands[1], operands[2]))
++    {
++      emit_insn (gen_insvsi_allegrex (operands[0], operands[1], operands[2],
++				      operands[3]));
++      DONE;
++    }
++  if (GET_CODE (operands[0]) != MEM || !register_operand (operands[3], VOIDmode))
++    FAIL;
++
+   /* If the field does not start on a byte boundary, then fail.  */
+   if (INTVAL (operands[2]) % 8 != 0)
+     FAIL;
+@@ -6508,6 +6653,22 @@ move\\t%0,%z4\\n\\
+     }
+ }")
+ 
++;; Block clears (Allegrex): a word-aligned constant-size clear (memset (p, 0, N), aggregate
++;; zero-initialisation) is a word store loop, see mips_expand_clrstr.  Clears of up to two pieces are
++;; still stored by pieces (CLEAR_RATIO 3, mips.h).  Anything else FAILs and calls memset.
++(define_expand "clrstrsi"
++  [(parallel [(set (match_operand:BLK 0 "general_operand" "")
++		   (const_int 0))
++	      (use (match_operand:SI 1 "arith32_operand" ""))
++	      (use (match_operand:SI 2 "immediate_operand" ""))])]
++  "!TARGET_MIPS16"
++  "
++{
++  if (mips_expand_clrstr (operands))
++    DONE;
++  FAIL;
++}")
++
+ ;; Insn generated by block moves
+ 
+ (define_insn "movstrsi_internal"
+@@ -7742,6 +7903,10 @@ move\\t%0,%z4\\n\\
+   if (TARGET_SR71K && GET_CODE (operands[2]) != CONST_INT)
+     return \"rorv\\t%0,%1,%2\";
+ 
++  if (TARGET_ALLEGREX)
++    return GET_CODE (operands[2]) == CONST_INT
++	   ? \"rotr\\t%0,%1,%2\" : \"rotrv\\t%0,%1,%2\";
++
+   if ((GET_CODE (operands[2]) == CONST_INT)
+       && (INTVAL (operands[2]) < 0 || INTVAL (operands[2]) >= 32))
+     abort ();
+@@ -11198,3 +11363,119 @@ ld\\t%2,%1-%S1(%2)\;daddu\\t%2,%2,$31\\n\\t%*j\\t%2"
+   [(set_attr "type"	"arith")
+    (set_attr "mode"	"DI")
+    (set_attr "length"	"40")])
++
++
++;; Allegrex instructions (as in pspdev's allegrex.md for GCC 4.0.2,
++;; written for the GCC 3.3 MIPS port).
++
++(define_insn "extzvsi_allegrex"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(zero_extract:SI (match_operand:SI 1 "register_operand" "d")
++			 (match_operand:SI 2 "immediate_operand" "I")
++			 (match_operand:SI 3 "immediate_operand" "I")))]
++  "mips_use_ins_ext_p (operands[1], operands[2], operands[3])"
++  "ext\t%0,%1,%3,%2"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "insvsi_allegrex"
++  [(set (zero_extract:SI (match_operand:SI 0 "register_operand" "+d")
++			 (match_operand:SI 1 "immediate_operand" "I")
++			 (match_operand:SI 2 "immediate_operand" "I"))
++	(match_operand:SI 3 "reg_or_0_operand" "dJ"))]
++  "mips_use_ins_ext_p (operands[0], operands[1], operands[2])"
++  "ins\t%0,%z3,%2,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "sminsi3"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(smin:SI (match_operand:SI 1 "register_operand" "d")
++		 (match_operand:SI 2 "register_operand" "d")))]
++  "ISA_HAS_MIN_MAX"
++  "min\t%0,%1,%2"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "smaxsi3"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(smax:SI (match_operand:SI 1 "register_operand" "d")
++		 (match_operand:SI 2 "register_operand" "d")))]
++  "ISA_HAS_MIN_MAX"
++  "max\t%0,%1,%2"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "allegrex_clz"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(unspec:SI [(match_operand:SI 1 "register_operand" "d")] UNSPEC_CLZ))]
++  "TARGET_ALLEGREX"
++  "clz\t%0,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "allegrex_clo"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(unspec:SI [(match_operand:SI 1 "register_operand" "d")] UNSPEC_CLO))]
++  "TARGET_ALLEGREX"
++  "clo\t%0,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "allegrex_wsbh"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(unspec:SI [(match_operand:SI 1 "register_operand" "d")] UNSPEC_WSBH))]
++  "TARGET_ALLEGREX"
++  "wsbh\t%0,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "allegrex_wsbw"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(unspec:SI [(match_operand:SI 1 "register_operand" "d")] UNSPEC_WSBW))]
++  "TARGET_ALLEGREX"
++  "wsbw\t%0,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "allegrex_bitrev"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(unspec:SI [(match_operand:SI 1 "register_operand" "d")] UNSPEC_BITREV))]
++  "TARGET_ALLEGREX"
++  "bitrev\t%0,%1"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
++
++(define_insn "allegrex_sync"
++  [(unspec_volatile [(const_int 0)] UNSPEC_SYNC)]
++  "TARGET_ALLEGREX"
++  "sync"
++  [(set_attr "type"	"unknown")
++   (set_attr "mode"	"none")])
++
++(define_insn "allegrex_cache"
++  [(unspec_volatile [(match_operand:SI 0 "const_int_operand" "")
++		     (match_operand:SI 1 "register_operand" "d")]
++		    UNSPEC_CACHE)]
++  "TARGET_ALLEGREX"
++  "cache\t%0,0(%1)"
++  [(set_attr "type"	"unknown")
++   (set_attr "mode"	"none")])
++
++;; Allegrex: clear a contiguous bit field with "ins rd,$0,pos,size"
++;; (combine canonicalises the zero_extract store into this AND).
++(define_insn "*andsi3_allegrex_ins"
++  [(set (match_operand:SI 0 "register_operand" "=d")
++	(and:SI (match_operand:SI 1 "register_operand" "0")
++		(match_operand:SI 2 "allegrex_ins_mask_operand" "")))]
++  "TARGET_ALLEGREX && !TARGET_MIPS16"
++  "*
++{
++  int pos, size;
++  mips_allegrex_ins_mask_p (INTVAL (operands[2]), &pos, &size);
++  operands[3] = GEN_INT (pos);
++  operands[4] = GEN_INT (size);
++  return \"ins\\t%0,$0,%3,%4\";
++}"
++  [(set_attr "type"	"arith")
++   (set_attr "mode"	"SI")])
+diff --git a/gcc/expmed.c b/gcc/expmed.c
+index 72ef6ce..e8204cd 100644
+--- a/gcc/expmed.c
++++ b/gcc/expmed.c
+@@ -701,11 +701,30 @@ store_bit_field (str_rtx, bitsize, bitnum, fieldmode, value, total_size)
+ 
+    Note that protect_from_queue has already been done on OP0 and VALUE.  */
+ 
++/* Nonzero while a bit-field store is being expanded (the Allegrex andsi3
++   expander keeps its expand-time insv there).  */
++int allegrex_bitfield_store_depth;
++
++static void store_fixed_bit_field_1	PARAMS ((rtx, unsigned HOST_WIDE_INT,
++						 unsigned HOST_WIDE_INT,
++						 unsigned HOST_WIDE_INT, rtx));
++
+ static void
+ store_fixed_bit_field (op0, offset, bitsize, bitpos, value)
+      rtx op0;
+      unsigned HOST_WIDE_INT offset, bitsize, bitpos;
+      rtx value;
++{
++  allegrex_bitfield_store_depth++;
++  store_fixed_bit_field_1 (op0, offset, bitsize, bitpos, value);
++  allegrex_bitfield_store_depth--;
++}
++
++static void
++store_fixed_bit_field_1 (op0, offset, bitsize, bitpos, value)
++     rtx op0;
++     unsigned HOST_WIDE_INT offset, bitsize, bitpos;
++     rtx value;
+ {
+   enum machine_mode mode;
+   unsigned int total_bits = BITS_PER_WORD;

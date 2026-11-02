@@ -1,0 +1,152 @@
+MIPS/Allegrex: add halt and accept the VFPU sync register $255
+
+The original Allegrex (PSP) firmware uses two instruction words that the
+assembler rejects:
+
+  halt              0x70000000  SPECIAL2 function 0: stop the pipeline
+                                until an interrupt is pending.  The name
+                                is the one used by pspdev's pspsh
+                                assembler/disassembler (psplinkusb), uOFW
+                                (pspHalt, common.S), prxtool and PPSSPP.
+  mfvc $zero, $255  0x486000ff  VFPU synchronisation: a read of the
+                                pseudo control register 127.  objdump
+                                already prints it this way, but the
+                                assembler only accepted $128-$143.
+
+Both are used e.g. by the 6.60 threadman module (idle loops and VFPU
+context switch).  The existing mfvc/mtvc entries are reused: only the
+register name and the range check of the VFPU control register operand
+are extended, with $255 as the single new value.
+
+---
+ gas/config/tc-mips.c                      | 6 ++++--
+ gas/testsuite/gas/mips/allegrex-vcr-err.d | 3 +++
+ gas/testsuite/gas/mips/allegrex-vcr-err.l | 4 ++++
+ gas/testsuite/gas/mips/allegrex-vcr-err.s | 4 ++++
+ gas/testsuite/gas/mips/allegrex.d         | 4 ++++
+ gas/testsuite/gas/mips/allegrex.s         | 4 ++++
+ gas/testsuite/gas/mips/mips.exp           | 1 +
+ include/opcode/vfpu.h                     | 1 +
+ opcodes/mips-opc.c                        | 1 +
+ 9 files changed, 26 insertions(+), 2 deletions(-)
+ create mode 100644 gas/testsuite/gas/mips/allegrex-vcr-err.d
+ create mode 100644 gas/testsuite/gas/mips/allegrex-vcr-err.l
+ create mode 100644 gas/testsuite/gas/mips/allegrex-vcr-err.s
+
+diff --git a/gas/config/tc-mips.c b/gas/config/tc-mips.c
+index 5c8d04d6..a14fdcdd 100644
+--- a/gas/config/tc-mips.c
++++ b/gas/config/tc-mips.c
+@@ -2947,7 +2947,8 @@ enum mips_vfpu_reg_shape {
+     {"$140",	RTYPE_VFPU_CTR | 140}, \
+     {"$141",	RTYPE_VFPU_CTR | 141}, \
+     {"$142",	RTYPE_VFPU_CTR | 142}, \
+-    {"$143",	RTYPE_VFPU_CTR | 143}
++    {"$143",	RTYPE_VFPU_CTR | 143}, \
++    {"$255",	RTYPE_VFPU_CTR | 255}
+ 
+ static const struct regname reg_names[] = {
+   GENERIC_REGISTER_NUMBERS,
+@@ -7074,7 +7075,8 @@ match_vfpu_operand (struct mips_arg_info *arg,
+     if (!match_reg (arg, OP_REG_VFPU_CTR, &uval))
+       return false;
+ 
+-    if (!(uval >= VF_MIN_VCR && uval <= VF_MAX_VCR)) {
++    /* $255 is not a register: "mfvc $zero, $255" synchronises the VFPU.  */
++    if (!(uval >= VF_MIN_VCR && uval <= VF_MAX_VCR) && uval != VF_SYNC_VCR) {
+       set_insn_error (arg->argnum, _("invalid coprocessor register"));
+       return false;
+     }
+diff --git a/gas/testsuite/gas/mips/allegrex-vcr-err.d b/gas/testsuite/gas/mips/allegrex-vcr-err.d
+new file mode 100644
+index 00000000..f1b4951b
+--- /dev/null
++++ b/gas/testsuite/gas/mips/allegrex-vcr-err.d
+@@ -0,0 +1,3 @@
++#name: MIPS Allegrex VFPU control register errors
++#as: -march=allegrex -mabi=32
++#error_output: allegrex-vcr-err.l
+diff --git a/gas/testsuite/gas/mips/allegrex-vcr-err.l b/gas/testsuite/gas/mips/allegrex-vcr-err.l
+new file mode 100644
+index 00000000..c43ba212
+--- /dev/null
++++ b/gas/testsuite/gas/mips/allegrex-vcr-err.l
+@@ -0,0 +1,4 @@
++.*: Assembler messages:
++.*:2: Error: invalid operands `mfvc \$2,\$127'
++.*:3: Error: invalid operands `mfvc \$2,\$144'
++.*:4: Error: invalid operands `mtvc \$2,\$144'
+diff --git a/gas/testsuite/gas/mips/allegrex-vcr-err.s b/gas/testsuite/gas/mips/allegrex-vcr-err.s
+new file mode 100644
+index 00000000..4f3deb4e
+--- /dev/null
++++ b/gas/testsuite/gas/mips/allegrex-vcr-err.s
+@@ -0,0 +1,4 @@
++	.set	noreorder
++	mfvc	$2, $127
++	mfvc	$2, $144
++	mtvc	$2, $144
+diff --git a/gas/testsuite/gas/mips/allegrex.d b/gas/testsuite/gas/mips/allegrex.d
+index b535c6db..69634b85 100644
+--- a/gas/testsuite/gas/mips/allegrex.d
++++ b/gas/testsuite/gas/mips/allegrex.d
+@@ -48,4 +48,8 @@ Disassembly of section .text:
+ 0x0000009c 7083083d 	mtdr	\$3,\$1
+ 0x000000a0 7000003f 	dbreak
+ 0x000000a4 7000003e 	dret
++0x000000a8 70000000 	halt
++0x000000ac 486000ff 	mfvc	\$0,\$255
++0x000000b0 48e000ff 	mtvc	\$0,\$255
++0x000000b4 4862008f 	mfvc	\$2,\$143
+ 	\.\.\.
+diff --git a/gas/testsuite/gas/mips/allegrex.s b/gas/testsuite/gas/mips/allegrex.s
+index df05f97e..c6a1d3af 100644
+--- a/gas/testsuite/gas/mips/allegrex.s
++++ b/gas/testsuite/gas/mips/allegrex.s
+@@ -42,6 +42,10 @@
+ 	mtdr	$v1, $1
+ 	dbreak
+ 	dret
++	halt
++	mfvc	$zero, $255
++	mtvc	$zero, $255
++	mfvc	$v0, $143
+ 
+ # Force some (non-delay-slot) zero bytes, to make 'objdump' print ...
+ 	.align	4, 0
+diff --git a/gas/testsuite/gas/mips/mips.exp b/gas/testsuite/gas/mips/mips.exp
+index d3877a02..ebc59e51 100644
+--- a/gas/testsuite/gas/mips/mips.exp
++++ b/gas/testsuite/gas/mips/mips.exp
+@@ -1651,6 +1651,7 @@ if { [istarget mips*-*-vxworks*] } {
+ 
+     run_dump_test "allegrex"
+     run_dump_test "allegrex-removed"
++    run_dump_test "allegrex-vcr-err"
+ 
+     run_list_test_arches "ext-ill"	[mips_arch_list_matching mips64r2]
+ 
+diff --git a/include/opcode/vfpu.h b/include/opcode/vfpu.h
+index 1fa1d321..4fe404f2 100644
+--- a/include/opcode/vfpu.h
++++ b/include/opcode/vfpu.h
+@@ -81,6 +81,7 @@
+ 
+ #define    VF_MIN_VCR      128
+ #define    VF_MAX_VCR      143
++#define    VF_SYNC_VCR     255
+ #define    VF_MIN_CONST        1
+ #define    VF_MAX_CONST        19
+ #define    VF_MIN_BCOND        0
+diff --git a/opcodes/mips-opc.c b/opcodes/mips-opc.c
+index 397fead8..8821a9ea 100644
+--- a/opcodes/mips-opc.c
++++ b/opcodes/mips-opc.c
+@@ -1301,6 +1301,7 @@ const struct mips_opcode mips_builtin_opcodes[] =
+ {"floor.l.s",		"D,S",		0x4600000b, 0xffff003f, WR_1|RD_2|FP_S|FP_D,	0,		I3_33,		0,	0 },
+ {"floor.w.d",		"D,S",		0x4620000f, 0xffff003f, WR_1|RD_2|FP_S|FP_D,	0,		I2,		0,	SF },
+ {"floor.w.s",		"D,S",		0x4600000f, 0xffff003f, WR_1|RD_2|FP_S,		0,		I2,		0,	0 },
++{"halt",		"",		0x70000000, 0xffffffff, NODS,			0,		ALX,		0,	0 },
+ {"hibernate",		"",		0x42000023, 0xffffffff,	0, 			0,		V1,		0,	0 },
+ {"hypcall",		"",		0x42000028, 0xffffffff, TRAP,			0,		0,		IVIRT,	0 },
+ {"hypcall",		"+J",		0x42000028, 0xffe007ff, TRAP,			0,		0,		IVIRT,	0 },

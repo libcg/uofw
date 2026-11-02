@@ -1,0 +1,15 @@
+diff --git a/gas/config/tc-mips.c b/gas/config/tc-mips.c
+index a14fdcdd..23d393bd 100644
+--- a/gas/config/tc-mips.c
++++ b/gas/config/tc-mips.c
+@@ -11099,6 +11100,10 @@ move_register (int dest, int source)
+       && !mips_opts.insn32
+       && !(history[0].insn_mo->pinfo2 & INSN2_BRANCH_DELAY_32BIT))
+     macro_build (NULL, "move", "mp,mj", dest, source);
++  /* The Allegrex assembler of the PSP SDK era (binutils 2.16) wrote move as addu, like all the 6.60 firmware
++     modules (3816 "addu rd, rs, $zero" and no "or rd, rs, $zero" in threadman).  */
++  else if (mips_opts.arch == CPU_ALLEGREX)
++    macro_build (NULL, "addu", "d,v,t", dest, source, 0);
+   else
+     macro_build (NULL, "or", "d,v,t", dest, source, 0);
+ }

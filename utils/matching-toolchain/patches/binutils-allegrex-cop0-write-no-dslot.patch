@@ -1,0 +1,23 @@
+--- a/gas/config/tc-mips.c
++++ b/gas/config/tc-mips.c
+@@ -8138,6 +8138,20 @@
+   if (history[0].fixed_p)
+     return false;
+ 
++  /* Allegrex: never move a coprocessor 0 register write (mtc0, ctc0) into the
++     delay slot of a j/jal, as the PSP SDK era assembler did (it had no COP
++     interlocks for COP writes), but without that assembler's nop padding.
++     6.60 firmware: all 7 C-level COP0 writes before a j/jal keep a nop slot
++     (threadman 3, interruptman 3, exceptionman 1), none is moved; COP0 reads
++     are still moved.  */
++  if (mips_opts.arch == CPU_ALLEGREX
++      && !mips_opts.mips16 && !mips_opts.micromips
++      && (history[0].insn_opcode >> 26) == 0x10
++      && (((history[0].insn_opcode >> 21) & 0x1f) == 4
++	  || ((history[0].insn_opcode >> 21) & 0x1f) == 6)
++      && ((ip->insn_opcode >> 26) == 2 || (ip->insn_opcode >> 26) == 3))
++    return false;
++
+   /* If the previous previous insn was in a .set noreorder, we can't
+      swap.  Actually, the MIPS assembler will swap in this situation.
+      However, gcc configured -with-gnu-as will generate code like

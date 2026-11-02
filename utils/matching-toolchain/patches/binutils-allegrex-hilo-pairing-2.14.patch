@@ -1,0 +1,57 @@
+--- a/gas/config/tc-mips.c
++++ b/gas/config/tc-mips.c
+@@ -16881,6 +16881,54 @@
+ 
+       seginfo = seg_info (l->seg);
+ 
++      /* Allegrex (PSP firmware toolchain): pair the %hi the way binutils
++	 2.14 did.  Scan the segment's fixups from the start in two passes;
++	 pass 0 takes the first %lo with the same symbol and offset that is
++	 not already preceded by its own %hi, pass 1 the first such %lo at
++	 all.  The %hi is moved immediately before it.  The 6.60 firmware's
++	 relocation streams follow this order (the binutils-2.14 %hi/%lo
++	 pairing); the 2.16+ rule below picks
++	 the last unmatched %lo with the smallest offset instead.  */
++      if (file_mips_opts.arch == CPU_ALLEGREX)
++	{
++	  int pass;
++
++	  looking_for_rtype = matching_lo_reloc (l->fixp->fx_r_type);
++	  for (pass = 0; pass < 2; pass++)
++	    {
++	      fixS *f, *prev = NULL;
++
++	      for (f = seginfo->fix_root; f != NULL; f = f->fx_next)
++		{
++		  if (f->fx_r_type == looking_for_rtype
++		      && f->fx_addsy == l->fixp->fx_addsy
++		      && f->fx_offset == l->fixp->fx_offset
++		      && (pass == 1
++			  || prev == NULL
++			  || !reloc_needs_lo_p (prev->fx_r_type)
++			  || !fixup_has_matching_lo_p (prev)))
++		    {
++		      fixS **pf;
++
++		      for (pf = &seginfo->fix_root; *pf != l->fixp;
++			   pf = &(*pf)->fx_next)
++			gas_assert (*pf != NULL);
++		      *pf = l->fixp->fx_next;
++		      l->fixp->fx_next = f;
++		      if (prev == NULL)
++			seginfo->fix_root = l->fixp;
++		      else
++			prev->fx_next = l->fixp;
++		      break;
++		    }
++		  prev = f;
++		}
++	      if (f != NULL)
++		break;
++	    }
++	  continue;
++	}
++
+       /* Set HI_POS to the position of this relocation in the chain.
+ 	 Set LO_POS to the position of the chosen low-part relocation.
+ 	 MATCHED_LO_P is true on entry to the loop if *POS is a low-part
