@@ -195,14 +195,14 @@ s32 sceKernelUnlockLwMutex(SceLwMutex *mutex, s32 count);
 s32 Kernel_Library_3AD10D4D(SceLwMutex *mutex);
 
 /**
- * \fixme Refers the lightweight mutex's status.
+ * Refers the lightweight mutex's status.
  *
  * @param mutex Pointer to a lightweight mutex structure.
- * @param addr Unknown.
+ * @param info Receives the status (info->size must be set).
  *
- * @return Unknown, may be SCE_ERROR_OK on success and <0 on error.
+ * @return SCE_ERROR_OK on success, otherwise <0 on error.
  */
-s32 sceKernelReferLwMutexStatus(SceLwMutex *mutex, u32 *addr);
+s32 sceKernelReferLwMutexStatus(SceLwMutex *mutex, SceKernelLwMutexInfo *info);
 
 /* Memory */
 

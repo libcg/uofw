@@ -210,8 +210,8 @@ s32 Kernel_Library_3AD10D4D(SceLwMutex *mutex)
 }
 
 // Kernel_Library_C1734599
-s32 sceKernelReferLwMutexStatus(SceLwMutex *mutex, u32 *addr)
+s32 sceKernelReferLwMutexStatus(SceLwMutex *mutex, SceKernelLwMutexInfo *info)
 {
     // ThreadManForUser_4C145944
-    return sceKernelReferLwMutexStatusByID(mutex->id, addr);
+    return sceKernelReferLwMutexStatusByID(mutex->id, info);
 }

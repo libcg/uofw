@@ -19,13 +19,34 @@ typedef struct {
 	u32 flags; // 8
 	s32 unk3; // 12
 	s32 id; // 16
-} SceLwMutex;
+	u32 unk20[3]; // 20
+} SceLwMutex; // size: 32
 
+typedef struct {
+    SceSize     size;
+} SceKernelLwMutexOptParam;
+
+typedef struct {
+    SceSize     size;
+    char        name[SCE_UID_NAME_LEN + 1];
+    SceUInt     attr;
+    SceUID      uid;
+    SceLwMutex  *workarea;
+    s32         initCount;
+    s32         currentCount;
+    SceUID      currentOwner;
+    s32         numWaitThreads;
+} SceKernelLwMutexInfo;
+
+s32 sceKernelCreateLwMutex(SceLwMutex *mutex, const char *name, u32 attr, s32 initCount,
+    SceKernelLwMutexOptParam *option);
+s32 sceKernelDeleteLwMutex(SceLwMutex *mutex);
 s32 _sceKernelLockLwMutexCB(SceLwMutex *mutex, s32 count, SceUInt *timeout);
 s32 _sceKernelLockLwMutex(SceLwMutex *mutex, s32 count, SceUInt *timeout);
+s32 _sceKernelTryLockLwMutex(SceLwMutex *mutex, s32 count);
 s32 _sceKernelUnlockLwMutex(SceLwMutex *mutex, s32 count);
-s32 sceKernelReferLwMutexStatusByID(s32 id, u32 *addr);
-s32 _sceKernelAllocateTlspl(s32, void*, s32);
+s32 sceKernelReferLwMutexStatusByID(SceUID id, SceKernelLwMutexInfo *info);
+int _sceKernelAllocateTlspl(SceUID uid, void **data, unsigned int *timeout);
 
 #endif /* THREADMAN_USER_H */
 

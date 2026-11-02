@@ -73,16 +73,23 @@ static inline int pspSetGp(int gp)
     return oldGp;
 }
 
+static inline int pspGetFp(void)
+{
+    int fp;
+    asm("move %0, $fp" : "=r" (fp));
+    return fp;
+}
+
 static inline int pspGetSp(void)
 {
     int sp;
-    asm("move %0, $sp" : "=r" (sp));
+    asm __volatile__ ("move %0, $sp" : "=r" (sp));
     return sp;
 }
 
 static inline void pspSetSp(int sp)
 {
-    asm("move $sp, %0" : : "r" (sp));
+    asm __volatile__ ("move $sp, %0" : : "r" (sp));
 }
 
 static inline int pspGetRa(void)
