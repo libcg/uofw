@@ -58,6 +58,19 @@ CFLAGS += -DINSTALLER
 OBJS := $(PATCH_OBJS) $(OBJS)
 endif
 
+# MATCHING=1: compile the C files with a recreation of the compiler used for the original modules
+# (GCC 3.3.6 and an assembler with Allegrex patches, built by utils/matching-toolchain/build.sh), for
+# modules which define MATCHING_CFLAGS. OLDGCC is the install directory given to build.sh.
+ifeq ($(MATCHING),1)
+ifndef OLDGCC
+$(error MATCHING=1 needs OLDGCC=<directory of the recreated compiler>)
+endif
+ifndef MATCHING_CFLAGS
+$(error MATCHING=1 is not supported by this module)
+endif
+MATCHING_CC ?= $(OLDGCC)/bin/oldcc.py $(OLDGCC)/3.3.6-sony
+endif
+
 MODULE_STUBS=$(foreach mod,$(MODULES), $($(mod)_STUBS))
 
 all: $(TARGET).prx
@@ -70,7 +83,11 @@ $(PRX_EXPORTS:.exp=.o): $(PRX_EXPORTS:.exp=.c)
 	$(CC) -c $^ -o $@ $(CFLAGS) -fno-builtin
 
 %.o: %.c
+ifeq ($(MATCHING),1)
+	$(MATCHING_CC) -c $^ -o $@ $(INCLUDE) $(MATCHING_CFLAGS)
+else
 	$(CC) -c $^ -o $@ $(CFLAGS)
+endif
 
 %.o: %.S
 	$(CC) -c $^ -o $@ $(CFLAGS_S)
